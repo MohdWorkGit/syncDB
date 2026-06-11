@@ -1,0 +1,6 @@
+.env
+.sync_checkpoint.json
+__pycache__/
+*.pyc
+.venv/
+venv/
