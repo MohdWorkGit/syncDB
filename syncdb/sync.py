@@ -1,8 +1,13 @@
-"""Core sync engine: throttled, resumable, batch copy between two Oracle tables.
+"""Core sync engine: throttled, resumable apply of an Oracle change log.
+
+The source table is a change log: each row carries an operation flag saying
+whether the target row should be inserted, updated, or deleted. The engine
+applies those changes to the target table in batches.
 
 Strategy
 --------
-The source table is read with *keyset pagination* on an indexed key column:
+The source is read with *keyset pagination* on its indexed key column
+(typically the change log's own sequence):
 
     SELECT ... WHERE key > :last_key ORDER BY key FETCH FIRST :n ROWS ONLY
 
@@ -11,11 +16,15 @@ flat no matter how large the table is — unlike OFFSET pagination, which gets
 slower the deeper it goes, and unlike one giant open cursor, which risks
 ORA-01555 (snapshot too old) on long runs.
 
+Within a batch, changes are deduplicated per target business key keeping the
+*latest* change (rows arrive in key order, so later wins): an insert followed
+by a delete nets out to a delete, a delete followed by a re-insert nets out
+to an upsert. Inserts and updates are then applied with one MERGE
+executemany() and deletes with one DELETE executemany() — both idempotent,
+so replaying a batch after a crash is harmless.
+
 After every batch the engine commits, persists a checkpoint, and sleeps, so
-the database only ever sees short bursts of light work. If the process dies
-it resumes from the checkpoint; duplicate inserts from the small
-crash-between-commit-and-checkpoint window are detected via ORA-00001 and
-skipped.
+the database only ever sees short bursts of light work.
 """
 
 import logging
@@ -27,7 +36,13 @@ import oracledb
 
 from .checkpoint import Checkpoint
 from .config import Config
-from .transformer import SOURCE_COLUMNS, TARGET_COLUMNS, transform
+from .transformer import (
+    SOURCE_COLUMNS,
+    TARGET_COLUMNS,
+    TARGET_KEY_COLUMNS,
+    transform,
+    transform_key,
+)
 
 log = logging.getLogger(__name__)
 
@@ -36,8 +51,6 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_$#]*$")
 # How many times to retry a batch after a connection failure before giving up.
 _MAX_RETRIES = 4
 _RETRY_BACKOFF_SECONDS = 5
-
-_ORA_UNIQUE_VIOLATION = 1  # ORA-00001
 
 
 def _identifier(name: str) -> str:
@@ -54,24 +67,50 @@ class TableSync:
         self.conn = None
         self._stop_requested = False
 
+        missing_keys = [c for c in TARGET_KEY_COLUMNS if c not in TARGET_COLUMNS]
+        if missing_keys:
+            raise ValueError(
+                f"TARGET_KEY_COLUMNS {missing_keys} not present in TARGET_COLUMNS"
+            )
+
         key = _identifier(config.key_column)
+        source = _identifier(config.source_table)
+        target = _identifier(config.target_table)
         src_cols = ", ".join(_identifier(c) for c in SOURCE_COLUMNS)
-        tgt_cols = ", ".join(_identifier(c) for c in TARGET_COLUMNS)
-        binds = ", ".join(f":{i + 1}" for i in range(len(TARGET_COLUMNS)))
+        tgt_cols = [_identifier(c) for c in TARGET_COLUMNS]
+        key_cols = [_identifier(c) for c in TARGET_KEY_COLUMNS]
+        non_key_cols = [c for c in tgt_cols if c not in key_cols]
 
         self.select_first_sql = (
-            f"SELECT {src_cols} FROM {_identifier(config.source_table)} "
+            f"SELECT {src_cols} FROM {source} "
             f"ORDER BY {key} FETCH FIRST :batch_size ROWS ONLY"
         )
         self.select_next_sql = (
-            f"SELECT {src_cols} FROM {_identifier(config.source_table)} "
+            f"SELECT {src_cols} FROM {source} "
             f"WHERE {key} > :last_key "
             f"ORDER BY {key} FETCH FIRST :batch_size ROWS ONLY"
         )
-        self.insert_sql = (
-            f"INSERT INTO {_identifier(config.target_table)} ({tgt_cols}) VALUES ({binds})"
+
+        # Upsert: bind positions follow TARGET_COLUMNS, i.e. transform() output.
+        using = ", ".join(f":{i + 1} AS {c}" for i, c in enumerate(tgt_cols))
+        on = " AND ".join(f"t.{c} = s.{c}" for c in key_cols)
+        update_set = ", ".join(f"t.{c} = s.{c}" for c in non_key_cols)
+        insert_cols = ", ".join(tgt_cols)
+        insert_vals = ", ".join(f"s.{c}" for c in tgt_cols)
+        self.merge_sql = (
+            f"MERGE INTO {target} t "
+            f"USING (SELECT {using} FROM dual) s "
+            f"ON ({on}) "
+            f"WHEN MATCHED THEN UPDATE SET {update_set} "
+            f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
         )
+
+        # Delete: bind positions follow TARGET_KEY_COLUMNS, i.e. transform_key().
+        where = " AND ".join(f"{c} = :{i + 1}" for i, c in enumerate(key_cols))
+        self.delete_sql = f"DELETE FROM {target} WHERE {where}"
+
         self.key_index = SOURCE_COLUMNS.index(config.key_column)
+        self.op_index = SOURCE_COLUMNS.index(config.op_column)
 
     # -- connection handling -------------------------------------------------
 
@@ -111,42 +150,63 @@ class TableSync:
                 )
             return cursor.fetchall()
 
-    def transform_batch(self, rows: list) -> list:
-        out = []
+    def plan_batch(self, rows: list) -> tuple:
+        """Turn raw change-log rows into deduplicated upsert/delete work lists.
+
+        Rows arrive ordered by the change key, so for several changes to the
+        same target row only the last one matters: dict insertion order plus
+        overwrite-on-repeat gives last-wins semantics.
+        """
+        ops = {
+            self.config.op_insert: "upsert",
+            self.config.op_update: "upsert",
+            self.config.op_delete: "delete",
+        }
+        plan = {}  # business key -> ("upsert", target_tuple) | ("delete", key_tuple)
         for raw in rows:
             row = dict(zip(SOURCE_COLUMNS, raw))
+            action = ops.get(raw[self.op_index])
+            if action is None:
+                log.warning(
+                    "Skipping %s=%s: unknown %s value %r",
+                    self.config.key_column, raw[self.key_index],
+                    self.config.op_column, raw[self.op_index],
+                )
+                continue
             try:
-                out.append(transform(row))
+                key = transform_key(row)
+                payload = transform(row) if action == "upsert" else key
             except ValueError as exc:
                 log.warning("Skipping row: %s", exc)
-        return out
+                continue
+            plan[key] = (action, payload)
 
-    def insert_batch(self, data: list) -> int:
-        """Insert transformed rows; returns the number actually inserted.
+        upserts = [p for a, p in plan.values() if a == "upsert"]
+        deletes = [p for a, p in plan.values() if a == "delete"]
+        return upserts, deletes
 
-        batcherrors=True lets the rest of the batch proceed when individual
-        rows fail. Unique-constraint violations (rows already copied before a
-        crash) are skipped quietly; anything else aborts the run.
+    def apply_batch(self, upserts: list, deletes: list) -> None:
+        """Apply one batch in a single transaction.
+
+        After dedup each business key appears in exactly one list, so the
+        order between the MERGE pass and the DELETE pass does not matter.
+        Both statements are idempotent, making crash-replays harmless.
         """
-        if not data:
-            return 0
         with self.conn.cursor() as cursor:
-            cursor.executemany(self.insert_sql, data, batcherrors=True)
-            errors = cursor.getbatcherrors()
-
-        duplicates = [e for e in errors if e.full_code == f"ORA-{_ORA_UNIQUE_VIOLATION:05d}"]
-        fatal = [e for e in errors if e.full_code != f"ORA-{_ORA_UNIQUE_VIOLATION:05d}"]
-
-        if fatal:
-            self.conn.rollback()
-            for err in fatal[:10]:
-                log.error("Insert failed at batch offset %s: %s", err.offset, err.message)
-            raise RuntimeError(f"{len(fatal)} row(s) failed to insert; batch rolled back")
-
+            if upserts:
+                cursor.executemany(self.merge_sql, upserts, batcherrors=True)
+                errors = cursor.getbatcherrors()
+                if errors:
+                    self.conn.rollback()
+                    for err in errors[:10]:
+                        log.error("Upsert failed at batch offset %s: %s",
+                                  err.offset, err.message)
+                    raise RuntimeError(
+                        f"{len(errors)} row(s) failed to upsert; batch rolled back"
+                    )
+            if deletes:
+                cursor.executemany(self.delete_sql, deletes)
         self.conn.commit()
-        if duplicates:
-            log.info("Skipped %d row(s) already present in target", len(duplicates))
-        return len(data) - len(duplicates)
 
     # -- main loop -----------------------------------------------------------
 
@@ -171,23 +231,23 @@ class TableSync:
                 if not rows:
                     elapsed = time.monotonic() - started
                     log.info(
-                        "Done. %d rows copied in %d batches (%.1fs).",
+                        "Done. %d change rows applied in %d batches (%.1fs).",
                         rows_processed, batch_number - 1, elapsed,
                     )
                     self.checkpoint.clear()
                     return
 
-                inserted = self._with_retries(
-                    self.insert_batch, self.transform_batch(rows)
-                )
+                upserts, deletes = self.plan_batch(rows)
+                self._with_retries(self.apply_batch, upserts, deletes)
                 rows_processed += len(rows)
                 last_key = rows[-1][self.key_index]
                 self.checkpoint.save(last_key, rows_processed)
 
                 log.info(
-                    "Batch %d: read %d, inserted %d (total %d, last %s=%s)",
-                    batch_number, len(rows), inserted, rows_processed,
-                    self.config.key_column, last_key,
+                    "Batch %d: read %d changes -> %d upserts, %d deletes "
+                    "(total %d, last %s=%s)",
+                    batch_number, len(rows), len(upserts), len(deletes),
+                    rows_processed, self.config.key_column, last_key,
                 )
 
                 # A short batch means we are at the tail of the table; loop

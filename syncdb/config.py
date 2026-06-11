@@ -21,6 +21,11 @@ class Config:
     target_table: str
     key_column: str
 
+    op_column: str
+    op_insert: str
+    op_update: str
+    op_delete: str
+
     checkpoint_file: str
     log_level: str
 
@@ -39,9 +44,13 @@ class Config:
             dsn=os.environ["ORACLE_DSN"],
             batch_size=int(os.getenv("BATCH_SIZE", "1000")),
             sleep_seconds=float(os.getenv("SLEEP_SECONDS", "5")),
-            source_table=os.getenv("SOURCE_TABLE", "SOURCE_ORDERS"),
+            source_table=os.getenv("SOURCE_TABLE", "ORDER_CHANGES"),
             target_table=os.getenv("TARGET_TABLE", "ORDER_SUMMARY"),
-            key_column=os.getenv("KEY_COLUMN", "ORDER_ID"),
+            key_column=os.getenv("KEY_COLUMN", "CHANGE_ID"),
+            op_column=os.getenv("OP_COLUMN", "OPERATION"),
+            op_insert=os.getenv("OP_INSERT", "I"),
+            op_update=os.getenv("OP_UPDATE", "U"),
+            op_delete=os.getenv("OP_DELETE", "D"),
             checkpoint_file=os.getenv("CHECKPOINT_FILE", ".sync_checkpoint.json"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
         )
