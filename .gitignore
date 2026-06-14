@@ -1,6 +1,6 @@
 .env
 .sync_checkpoint.json
-__pycache__/
-*.pyc
-.venv/
-venv/
+
+# .NET build output
+bin/
+obj/
