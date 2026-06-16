@@ -4,3 +4,6 @@
 # .NET build output
 bin/
 obj/
+
+# Offline air-gapped build bundle (see scripts/prepare-offline-bundle.ps1)
+offline-bundle/

@@ -21,7 +21,19 @@ public sealed record SyncConfig(
     string OpUpdate,
     string OpDelete,
     string CheckpointFile,
-    string LogLevel)
+    string LogLevel,
+    string LogFile,
+    string LinkTable,
+    string LinkIdColumn,
+    string LinkUserColumn,
+    string LinkSectionColumn,
+    string SyncUserId,
+    string SyncUserSection,
+    string ProcessedColumn,
+    string ProcessedPending,
+    string ProcessedDone,
+    string HistoryTable,
+    string QuarantineTable)
 {
     public static SyncConfig FromEnvironment()
     {
@@ -35,7 +47,7 @@ public sealed record SyncConfig(
                 "Copy .env.example to .env and fill it in.");
         }
 
-        return new SyncConfig(
+        return Validate(new SyncConfig(
             User: Required("ORACLE_USER"),
             Password: Required("ORACLE_PASSWORD"),
             Dsn: Required("ORACLE_DSN"),
@@ -49,8 +61,63 @@ public sealed record SyncConfig(
             OpUpdate: Get("OP_UPDATE", "U"),
             OpDelete: Get("OP_DELETE", "D"),
             CheckpointFile: Get("CHECKPOINT_FILE", ".sync_checkpoint.json"),
-            LogLevel: Get("LOG_LEVEL", "INFO"));
+            LogLevel: Get("LOG_LEVEL", "INFO"),
+            LogFile: Get("LOG_FILE", ""),
+            // Link table: when set, every change row with OP_INSERT also writes a
+            // row connecting the new target row to a user. The link row carries its
+            // own id (set to MAX(id)+1), the target business key, the fixed user id,
+            // and the fixed user section.
+            LinkTable: Get("LINK_TABLE", ""),
+            LinkIdColumn: Get("LINK_ID_COLUMN", "LINK_ID"),
+            LinkUserColumn: Get("LINK_USER_COLUMN", "USER_ID"),
+            LinkSectionColumn: Get("LINK_SECTION_COLUMN", "USER_SECTION"),
+            SyncUserId: Get("SYNC_USER_ID", ""),
+            SyncUserSection: Get("SYNC_USER_SECTION", ""),
+            // Processed column: when set, the source acts as a work queue — only
+            // rows whose flag equals PROCESSED_PENDING are read, and they are
+            // stamped PROCESSED_DONE in the same transaction that applies them.
+            ProcessedColumn: Get("PROCESSED_COLUMN", ""),
+            ProcessedPending: Get("PROCESSED_PENDING", "0"),
+            ProcessedDone: Get("PROCESSED_DONE", "1"),
+            // Audit/quarantine: when HISTORY_TABLE is set, every change row's
+            // outcome is recorded; when QUARANTINE_TABLE is set, a row whose
+            // insert fails is quarantined so all its later changes are skipped.
+            HistoryTable: Get("HISTORY_TABLE", ""),
+            QuarantineTable: Get("QUARANTINE_TABLE", "")));
+
+        static SyncConfig Validate(SyncConfig cfg)
+        {
+            if (cfg.LinkEnabled && cfg.SyncUserId.Length == 0)
+            {
+                throw new ConfigException(
+                    "LINK_TABLE is set but SYNC_USER_ID is empty. Set SYNC_USER_ID to the " +
+                    "user id to record for each inserted row, or clear LINK_TABLE to disable linking.");
+            }
+            if (cfg.LinkEnabled && cfg.SyncUserSection.Length == 0)
+            {
+                throw new ConfigException(
+                    "LINK_TABLE is set but SYNC_USER_SECTION is empty. Set SYNC_USER_SECTION to the " +
+                    "section to record for each inserted row, or clear LINK_TABLE to disable linking.");
+            }
+            return cfg;
+        }
     }
+
+    /// <summary>Whether to write a user-link row for each inserted target row.</summary>
+    public bool LinkEnabled => LinkTable.Length > 0;
+
+    /// <summary>Whether the source is consumed as a queue via a processed flag.</summary>
+    public bool ProcessedEnabled => ProcessedColumn.Length > 0;
+
+    /// <summary>Whether each change row's outcome is recorded to a history table.</summary>
+    public bool AuditEnabled => HistoryTable.Length > 0;
+
+    /// <summary>
+    /// Whether a row whose insert fails is quarantined. When on, a failed insert
+    /// no longer aborts the batch — it is isolated, recorded, and all later
+    /// changes for that business key are skipped.
+    /// </summary>
+    public bool QuarantineEnabled => QuarantineTable.Length > 0;
 
     /// <summary>Build the ODP.NET connection string from the user/password/DSN.</summary>
     public string ConnectionString =>

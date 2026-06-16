@@ -60,15 +60,20 @@ if (sleepSeconds is { } ss)
     config = config with { SleepSeconds = ss };
 }
 
+var logLevel = ParseLevel(config.LogLevel);
 using var loggerFactory = LoggerFactory.Create(builder =>
 {
     builder
-        .SetMinimumLevel(ParseLevel(config.LogLevel))
+        .SetMinimumLevel(logLevel)
         .AddSimpleConsole(o =>
         {
             o.SingleLine = true;
             o.TimestampFormat = "yyyy-MM-dd HH:mm:ss ";
         });
+    if (config.LogFile.Length > 0)
+    {
+        builder.AddProvider(new FileLoggerProvider(config.LogFile, logLevel));
+    }
 });
 
 var log = loggerFactory.CreateLogger("syncdb");

@@ -13,10 +13,15 @@ namespace SyncDb;
 /// flattened ORDER_SUMMARY reporting table (see sql/example_tables.sql):
 ///
 ///   - first/last name are merged into a single CUSTOMER_NAME
-///   - the order date is split into ORDER_YEAR / ORDER_MONTH
+///   - the date, stored as three text columns ORDER_DAY / ORDER_MONTH /
+///     ORDER_YEAR, is merged into a single ORDER_DATE (Oracle DATE)
 ///   - the total is computed from UNIT_PRICE * QUANTITY
-///   - 2-letter status codes are decoded into readable values
-///   - country codes are bucketed into regions
+///   - 2-letter status codes are mapped to readable values (STATUS_CODE -> STATUS)
+///   - country codes are bucketed into regions (COUNTRY_CODE -> REGION)
+///
+/// The StatusMap / RegionMap lookups below are the pattern to copy for "map a
+/// column of codes to another list of codes": put the pairs in a Dictionary and
+/// look them up with a default for unknown codes.
 ///
 /// Delete rows usually carry only the business key (other columns NULL), which
 /// is why key extraction (<see cref="TransformKey"/>) is separate from full
@@ -33,7 +38,11 @@ public static class Transformer
         "ORDER_ID",
         "CUST_FIRST_NAME",
         "CUST_LAST_NAME",
-        "ORDER_DATE",
+        // The order date arrives split across three text columns; Transform()
+        // merges them into one ORDER_DATE below.
+        "ORDER_DAY",
+        "ORDER_MONTH",
+        "ORDER_YEAR",
         "UNIT_PRICE",
         "QUANTITY",
         "STATUS_CODE",
@@ -45,8 +54,7 @@ public static class Transformer
     [
         "ORDER_ID",
         "CUSTOMER_NAME",
-        "ORDER_YEAR",
-        "ORDER_MONTH",
+        "ORDER_DATE",
         "TOTAL_AMOUNT",
         "STATUS",
         "REGION",
@@ -95,8 +103,7 @@ public static class Transformer
             customerName = "UNKNOWN";
         }
 
-        var orderDate = row.Date("ORDER_DATE")
-            ?? throw new TransformException($"ORDER_ID={row["ORDER_ID"]}: ORDER_DATE is NULL");
+        var orderDate = BuildDate(row);
 
         var unitPrice = row.Num("UNIT_PRICE") ?? 0m;
         var quantity = row.Num("QUANTITY") ?? 0m;
@@ -105,13 +112,50 @@ public static class Transformer
         [
             row["ORDER_ID"],
             customerName,
-            orderDate.Year,
-            orderDate.Month,
+            orderDate,
             Math.Round(unitPrice * quantity, 2, MidpointRounding.ToEven),
             StatusMap.GetValueOrDefault(row.Str("STATUS_CODE") ?? string.Empty, "UNKNOWN"),
             RegionMap.GetValueOrDefault(row.Str("COUNTRY_CODE") ?? string.Empty, "OTHER"),
             DateTime.Now,
         ];
+    }
+
+    /// <summary>
+    /// Merge the three text date parts (day, month, year) into one DATE. Throws
+    /// <see cref="TransformException"/> if a part is missing, non-numeric, or the
+    /// combination is not a real calendar date — the row is then logged and skipped.
+    /// </summary>
+    private static DateTime BuildDate(Row row)
+    {
+        var day = row.Str("ORDER_DAY")?.Trim();
+        var month = row.Str("ORDER_MONTH")?.Trim();
+        var year = row.Str("ORDER_YEAR")?.Trim();
+
+        if (string.IsNullOrEmpty(day) || string.IsNullOrEmpty(month) || string.IsNullOrEmpty(year))
+        {
+            throw new TransformException(
+                $"ORDER_ID={row["ORDER_ID"]}: incomplete date parts " +
+                $"(day='{day}', month='{month}', year='{year}')");
+        }
+
+        if (!int.TryParse(day, NumberStyles.Integer, CultureInfo.InvariantCulture, out var d) ||
+            !int.TryParse(month, NumberStyles.Integer, CultureInfo.InvariantCulture, out var m) ||
+            !int.TryParse(year, NumberStyles.Integer, CultureInfo.InvariantCulture, out var y))
+        {
+            throw new TransformException(
+                $"ORDER_ID={row["ORDER_ID"]}: non-numeric date parts " +
+                $"(day='{day}', month='{month}', year='{year}')");
+        }
+
+        try
+        {
+            return new DateTime(y, m, d);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            throw new TransformException(
+                $"ORDER_ID={row["ORDER_ID"]}: invalid date (day={d}, month={m}, year={y})");
+        }
     }
 }
 

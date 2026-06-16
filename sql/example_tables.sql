@@ -1,6 +1,26 @@
--- Example schema matching the shipped transformer (syncdb/transformer.py).
+-- Example schema matching the shipped transformer (src/Transformer.cs).
 -- Adapt or replace with your real tables; the sync engine only needs the
 -- key column on the source to be indexed (a primary key is ideal).
+
+-- Start from scratch: drop the example tables if they already exist, so this
+-- script can be re-run cleanly. Each drop is wrapped so a missing table
+-- (ORA-00942) is ignored; any other error still surfaces. Indexes drop with
+-- their table. WARNING: this destroys any data in these tables.
+BEGIN
+    FOR t IN (
+        SELECT column_value AS name FROM TABLE(sys.odcivarchar2list(
+            'ORDER_CHANGES', 'ORDER_SUMMARY', 'ORDER_USER_LINK',
+            'SYNC_ROW_HISTORY', 'SYNC_QUARANTINE'))
+    ) LOOP
+        BEGIN
+            EXECUTE IMMEDIATE 'DROP TABLE ' || t.name || ' CASCADE CONSTRAINTS PURGE';
+        EXCEPTION
+            WHEN OTHERS THEN
+                IF SQLCODE != -942 THEN RAISE; END IF;  -- -942 = table does not exist
+        END;
+    END LOOP;
+END;
+/
 
 -- Source: change log, potentially hundreds of millions of rows. Each row
 -- says what happened to one order: 'I' = inserted, 'U' = updated,
@@ -13,20 +33,31 @@ CREATE TABLE order_changes (
     order_id        NUMBER         NOT NULL,
     cust_first_name VARCHAR2(100),
     cust_last_name  VARCHAR2(100),
-    order_date      DATE,
+    -- The date arrives split across three text columns; the transformer merges
+    -- them into the single ORDER_DATE (DATE) column on the target.
+    order_day       VARCHAR2(2),
+    order_month     VARCHAR2(2),
+    order_year      VARCHAR2(4),
     unit_price      NUMBER(12, 2),
     quantity        NUMBER(8),
     status_code     VARCHAR2(2),
     country_code    VARCHAR2(2),
+    -- Queue flag (PROCESSED_COLUMN): 0 = not yet applied, 1 = done. The sync
+    -- reads only pending rows and stamps them done as it commits each batch.
+    processed       NUMBER(1)      DEFAULT 0 NOT NULL
+                    CONSTRAINT order_changes_processed_ck CHECK (processed IN (0, 1)),
     CONSTRAINT order_changes_pk PRIMARY KEY (change_id)
 );
+
+-- Index that makes "next slice of pending rows in key order" a cheap range scan
+-- (the query the queue mode runs every batch: WHERE processed = 0 ORDER BY change_id).
+CREATE INDEX order_changes_pending_ix ON order_changes (processed, change_id);
 
 -- Target: reshaped reporting table kept in sync by applying the change log.
 CREATE TABLE order_summary (
     order_id      NUMBER        NOT NULL,
     customer_name VARCHAR2(201) NOT NULL,
-    order_year    NUMBER(4)     NOT NULL,
-    order_month   NUMBER(2)     NOT NULL,
+    order_date    DATE          NOT NULL,
     total_amount  NUMBER(14, 2) NOT NULL,
     status        VARCHAR2(20)  NOT NULL,
     region        VARCHAR2(20)  NOT NULL,
@@ -34,10 +65,150 @@ CREATE TABLE order_summary (
     CONSTRAINT order_summary_pk PRIMARY KEY (order_id)
 );
 
--- Optional: seed a little demo data — inserts, some updates, some deletes.
+-- Link table (LINK_TABLE): connects each newly inserted order to a user. One row
+-- is written here for every change-log row with operation = 'I'. The row carries
+-- its own id (LINK_ID, which the sync sets to MAX(link_id)+1), the order_id, the
+-- fixed SYNC_USER_ID, and the fixed SYNC_USER_SECTION. The (order_id, user_id,
+-- user_section) triple is unique so re-running a batch after a crash never
+-- duplicates a link (MERGE-on-no-match).
+CREATE TABLE order_user_link (
+    link_id      NUMBER       NOT NULL,   -- own id; sync fills it as MAX(link_id)+1
+    order_id     NUMBER       NOT NULL,
+    user_id      VARCHAR2(64) NOT NULL,
+    user_section VARCHAR2(64) NOT NULL,
+    CONSTRAINT order_user_link_pk PRIMARY KEY (link_id),
+    CONSTRAINT order_user_link_uq UNIQUE (order_id, user_id, user_section)
+);
+
+-- History table (HISTORY_TABLE): one row per change processed, the full audit
+-- trail of what happened to each order. CHANGE_ID is the source key, so it is the
+-- natural primary key and makes the history write idempotent on replay; if a change
+-- id is re-processed (a quarantined row that requeues after its key is cleared) its
+-- row is updated in place to the latest outcome. OUTCOME is
+-- one of UPSERTED, DELETED, SUPERSEDED, SKIPPED_BADROW, SKIPPED_QUARANTINED,
+-- QUARANTINED, FAILED; DETAIL carries the reason for the bad/failed/quarantined ones.
+CREATE TABLE sync_row_history (
+    change_id   NUMBER        NOT NULL,
+    order_id    NUMBER,                   -- business key (NULL if it couldn't be read)
+    operation   VARCHAR2(8),              -- the source operation flag (I/U/D or other)
+    outcome     VARCHAR2(24)  NOT NULL,
+    detail      VARCHAR2(400),
+    recorded_at TIMESTAMP     NOT NULL,
+    CONSTRAINT sync_row_history_pk PRIMARY KEY (change_id)
+);
+-- Trace one order's whole history: SELECT * FROM sync_row_history WHERE order_id = :id ORDER BY change_id;
+CREATE INDEX sync_row_history_order_ix ON sync_row_history (order_id, change_id);
+
+-- Quarantine table (QUARANTINE_TABLE): business keys whose insert failed. Once a
+-- key is here, every later change for it (update or delete) is skipped on sight.
+-- Loaded into memory at startup and added to as failures occur. Remove a row here
+-- (and reset its source rows to pending) to let a fixed order flow again.
+CREATE TABLE sync_quarantine (
+    order_id       NUMBER    NOT NULL,
+    quarantined_at TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
+    CONSTRAINT sync_quarantine_pk PRIMARY KEY (order_id)
+);
+
+-- ---------------------------------------------------------------------------
+-- Demo seed: a small, traceable mix of every case so you can watch the engine
+-- end to end. Change rows are processed in CHANGE_ID order, i.e. the order the
+-- INSERTs below run, so each update/delete lands after the insert it refers to.
+-- The date is stored as three text parts (day/month/year), as the transformer
+-- expects. Delete this block (or swap in the bulk generator further down) when
+-- you load your own data.
+-- ---------------------------------------------------------------------------
+
+-- 1) Five new orders (operation 'I').
+INSERT INTO order_changes (operation, order_id, cust_first_name, cust_last_name,
+                           order_day, order_month, order_year, unit_price, quantity,
+                           status_code, country_code)
+            SELECT 'I', 1001, 'Ada',       'Lovelace', '05', '01', '2026', 120.00,  2, 'NW', 'GB' FROM dual
+  UNION ALL SELECT 'I', 1002, 'Alan',      'Turing',   '11', '02', '2026',  80.50,  1, 'NW', 'GB' FROM dual
+  UNION ALL SELECT 'I', 1003, 'Grace',     'Hopper',   '20', '02', '2026',  49.99,  3, 'NW', 'US' FROM dual
+  UNION ALL SELECT 'I', 1004, 'Katherine', 'Johnson',  '01', '03', '2026',  15.00, 10, 'NW', 'US' FROM dual
+  UNION ALL SELECT 'I', 1005, 'Edsger',    'Dijkstra', '03', '03', '2026', 200.00,  1, 'NW', 'DE' FROM dual;
+
+-- 2) Two later updates (status code changes to shipped / delivered).
+INSERT INTO order_changes (operation, order_id, cust_first_name, cust_last_name,
+                           order_day, order_month, order_year, unit_price, quantity,
+                           status_code, country_code)
+            SELECT 'U', 1001, 'Ada',   'Lovelace', '05', '01', '2026', 120.00, 2, 'SH', 'GB' FROM dual
+  UNION ALL SELECT 'U', 1003, 'Grace', 'Hopper',   '20', '02', '2026',  49.99, 3, 'DL', 'US' FROM dual;
+
+-- 3) One delete — order 1004 is removed (delete rows carry only the business key).
+INSERT INTO order_changes (operation, order_id) VALUES ('D', 1004);
+
+-- 4) Quarantine cases: inserts the transformer rejects because the date parts
+--    are not a real date. With QUARANTINE_TABLE set, each key is quarantined
+--    (outcome QUARANTINED) and a row is written to SYNC_QUARANTINE; without it,
+--    the insert is simply logged and skipped (SKIPPED_BADROW).
+INSERT INTO order_changes (operation, order_id, cust_first_name, cust_last_name,
+                           order_day, order_month, order_year, unit_price, quantity,
+                           status_code, country_code)
+            SELECT 'I', 2001, 'Bad', 'Month', '10', '13', '2026', 10.00, 1, 'NW', 'US' FROM dual  -- month 13
+  UNION ALL SELECT 'I', 2002, 'Bad', 'Day',   'XX', '06', '2026', 10.00, 1, 'NW', 'US' FROM dual; -- non-numeric day
+
+-- 5) SEVERAL later changes for each quarantined key — all with valid data — to
+--    confirm the key stays blocked once quarantined: EVERY one of these becomes
+--    SKIPPED_QUARANTINED, no matter the operation, and the target row is never
+--    created or touched. The key stays blocked until you clear it (see
+--    "Re-running quarantined rows" below). With quarantine OFF instead, the first
+--    valid 'U'/'I' here would recreate the row.
+INSERT INTO order_changes (operation, order_id, cust_first_name, cust_last_name,
+                           order_day, order_month, order_year, unit_price, quantity,
+                           status_code, country_code)
+            -- 2001: an update, then another update, then a re-insert attempt.
+            SELECT 'U', 2001, 'Now',   'Valid',     '10', '12', '2026',  10.00, 1, 'SH', 'US' FROM dual
+  UNION ALL SELECT 'U', 2001, 'Still', 'Blocked',   '11', '12', '2026',  12.00, 2, 'DL', 'US' FROM dual
+  UNION ALL SELECT 'I', 2001, 'Retry', 'Insert',    '12', '12', '2026',  15.00, 1, 'NW', 'US' FROM dual
+            -- 2002: a re-insert attempt, then an update.
+  UNION ALL SELECT 'I', 2002, 'Retry', 'Insert',    '07', '06', '2026',  20.00, 1, 'NW', 'US' FROM dual
+  UNION ALL SELECT 'U', 2002, 'Still', 'Blocked',   '08', '06', '2026',  22.00, 3, 'SH', 'US' FROM dual;
+-- ...and a couple of deletes for the same blocked keys — skipped too.
+INSERT INTO order_changes (operation, order_id) VALUES ('D', 2001);
+INSERT INTO order_changes (operation, order_id) VALUES ('D', 2002);
+
+COMMIT;
+
+-- After a run with HISTORY_TABLE + QUARANTINE_TABLE set, inspect the outcomes:
+--   SELECT change_id, order_id, operation, outcome, detail
+--     FROM sync_row_history ORDER BY change_id;
+--   SELECT * FROM order_summary   ORDER BY order_id;   -- 1001(SHIPPED),1002,1003(DELIVERED),1005; 1004 gone
+--   SELECT * FROM order_user_link ORDER BY link_id;    -- one link per landed insert
+--   SELECT * FROM sync_quarantine ORDER BY order_id;   -- 2001, 2002 (still just one row each)
+-- Every change for 2001/2002 after the first failed insert is SKIPPED_QUARANTINED:
+--   SELECT order_id, operation, outcome FROM sync_row_history
+--     WHERE order_id IN (2001, 2002) ORDER BY change_id;
+
+-- ---------------------------------------------------------------------------
+-- Re-running quarantined rows
+-- ---------------------------------------------------------------------------
+-- A quarantined key is loaded into memory at startup and blocks every later
+-- change for that key. To let it flow again after you have FIXED the data:
+--   1. Remove the key from the quarantine table:
+--        DELETE FROM sync_quarantine WHERE order_id = 2001;
+--        COMMIT;
+--   2. Restart the sync process — it reloads the (now smaller) quarantine set at
+--      startup; deleting the row mid-run has no effect until then.
+-- In QUEUE mode that is all you need: the key's change rows were kept PENDING (a
+-- quarantined key is never stamped processed) and were only hidden by the
+-- quarantine anti-join, so once the quarantine row is gone they requeue and apply
+-- in CHANGE_ID order on their own — no processed-flag reset required.
+-- In KEYSET mode (no processed flag) the engine only reads CHANGE_IDs past its
+-- checkpoint, so instead insert a NEW corrected change row (it gets a fresh, higher
+-- CHANGE_ID) or rerun with --restart to rescan from the beginning.
+
+-- ---------------------------------------------------------------------------
+-- Bulk generator (optional): swap the small seed above for this to stress-test
+-- with 100k inserts, plus updates on every 10th and deletes on every 100th.
+-- ---------------------------------------------------------------------------
 -- INSERT INTO order_changes (operation, order_id, cust_first_name, cust_last_name,
---                            order_date, unit_price, quantity, status_code, country_code)
--- SELECT 'I', LEVEL, 'First' || LEVEL, 'Last' || LEVEL, SYSDATE - MOD(LEVEL, 365),
+--                            order_day, order_month, order_year,
+--                            unit_price, quantity, status_code, country_code)
+-- SELECT 'I', LEVEL, 'First' || LEVEL, 'Last' || LEVEL,
+--        TO_CHAR(SYSDATE - MOD(LEVEL, 365), 'DD'),
+--        TO_CHAR(SYSDATE - MOD(LEVEL, 365), 'MM'),
+--        TO_CHAR(SYSDATE - MOD(LEVEL, 365), 'YYYY'),
 --        ROUND(DBMS_RANDOM.VALUE(1, 500), 2), TRUNC(DBMS_RANDOM.VALUE(1, 10)),
 --        CASE MOD(LEVEL, 4) WHEN 0 THEN 'NW' WHEN 1 THEN 'SH'
 --                           WHEN 2 THEN 'DL' ELSE 'CN' END,
@@ -47,8 +218,10 @@ CREATE TABLE order_summary (
 --
 -- -- Every 10th order later got shipped...
 -- INSERT INTO order_changes (operation, order_id, cust_first_name, cust_last_name,
---                            order_date, unit_price, quantity, status_code, country_code)
--- SELECT 'U', order_id, cust_first_name, cust_last_name, order_date,
+--                            order_day, order_month, order_year,
+--                            unit_price, quantity, status_code, country_code)
+-- SELECT 'U', order_id, cust_first_name, cust_last_name,
+--        order_day, order_month, order_year,
 --        unit_price, quantity, 'SH', country_code
 -- FROM order_changes WHERE operation = 'I' AND MOD(order_id, 10) = 0;
 --
