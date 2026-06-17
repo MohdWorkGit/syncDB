@@ -1,8 +1,10 @@
+using System.Data;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using Oracle.ManagedDataAccess.Client;
+using Oracle.ManagedDataAccess.Types;
 
 namespace SyncDb;
 
@@ -11,26 +13,25 @@ namespace SyncDb;
 ///
 /// The source table is a change log: each row carries an operation flag saying
 /// whether the target row should be inserted, updated, or deleted. The engine
-/// applies those changes to the target table in batches.
+/// reads the source in batches and, for each row, runs the <em>hand-written SQL
+/// statement</em> for that operation — one editable <c>.sql</c> file each for
+/// insert, update, and delete (see <see cref="SyncConfig"/>). Each <c>:NAME</c>
+/// placeholder in those statements is bound from the source row by column name,
+/// so the whole transformation lives in SQL you can edit.
 ///
 /// Strategy
 /// --------
 /// The source is read with <em>keyset pagination</em> on its indexed key column
 /// (typically the change log's own sequence):
 ///
-///     SELECT ... WHERE key &gt; :last_key ORDER BY key FETCH FIRST :n ROWS ONLY
+///     SELECT * FROM source WHERE key &gt; :last_key ORDER BY key FETCH FIRST :n ROWS ONLY
 ///
-/// Each query touches only the next slice of the index, so the cost per batch
-/// is flat no matter how large the table is — unlike OFFSET pagination, which
-/// gets slower the deeper it goes, and unlike one giant open cursor, which
-/// risks ORA-01555 (snapshot too old) on long runs.
-///
-/// Within a batch, <em>every</em> change is applied in the order it arrives —
-/// changes are not coalesced, so a key with several changes in one batch has all
-/// of them replayed in sequence. To keep that ordering correct, consecutive
-/// changes of the same kind are grouped into one array-bound MERGE (inserts and
-/// updates) or DELETE, and a new array DML is started whenever the kind switches.
-/// Every statement is idempotent, so replaying a batch after a crash is harmless.
+/// Each query touches only the next slice of the index, so the cost per batch is
+/// flat no matter how large the table is. Within a batch every change is applied
+/// in arrival order, one row at a time, each on its own savepoint so a single bad
+/// row is isolated instead of dooming the batch. Every statement is expected to be
+/// idempotent (MERGE / "if exists" deletes), so replaying a batch after a crash is
+/// harmless.
 ///
 /// After every batch the engine commits, persists a checkpoint, and sleeps, so
 /// the database only ever sees short bursts of light work.
@@ -40,17 +41,24 @@ public sealed partial class TableSync
     // How many times to retry a batch after a connection failure before giving up.
     private const int MaxRetries = 4;
     private const int RetryBackoffSeconds = 5;
+    private const int HistoryDetailMax = 400;
 
     private readonly SyncConfig _config;
     private readonly ILogger _log;
-    private readonly Dictionary<string, int> _columnIndex;
-    private readonly int _keyIndex;
-    private readonly int _opIndex;
 
+    // Hand-written per-operation SQL and the :NAME binds each one references.
+    private readonly string _insertSql;
+    private readonly string _updateSql;
+    private readonly string _deleteSql;
+    private readonly string? _linkSql;
+    private readonly string[] _insertBinds;
+    private readonly string[] _updateBinds;
+    private readonly string[] _deleteBinds;
+    private readonly string[] _linkBinds = [];
+
+    // SELECT * fetch (keyset + queue variants).
     private readonly string _selectFirstSql;
     private readonly string _selectNextSql;
-    private readonly string _mergeSql;
-    private readonly string _deleteSql;
 
     // Queue mode (processed flag) — null unless PROCESSED_COLUMN is configured.
     private readonly string? _selectPendingSql;
@@ -58,25 +66,22 @@ public sealed partial class TableSync
     private readonly object? _processedPending;
     private readonly object? _processedDone;
 
-    // User-link mode — null/zero unless LINK_TABLE is configured.
-    private readonly string? _linkMergeSql;
-    private readonly string? _linkDeleteSql;
-    private readonly int _linkColumnCount;
-    private readonly object? _syncUserId;
-    private readonly object? _syncUserSection;
-
     // Audit/quarantine — null unless HISTORY_TABLE / QUARANTINE_TABLE configured.
     private readonly string? _historyMergeSql;
     private readonly int _historyColumnCount;
     private readonly string? _quarantineMergeSql;
     private readonly string? _quarantineSelectSql;
-    private const int HistoryDetailMax = 400;
 
-    // op value -> "upsert" | "delete"
-    private readonly Dictionary<string, string> _actions;
     // Business keys whose insert failed: every later change for them is skipped.
     // Loaded from the quarantine table at startup, then kept in sync in memory.
     private readonly HashSet<RowKey> _quarantine = [];
+
+    // Column name -> ordinal, resolved from the reader the first time we fetch
+    // (SELECT * gives whatever the source table has). Stable across batches.
+    private Dictionary<string, int>? _columnOrdinals;
+    private int _keyOrdinal = -1;
+    private int _opOrdinal = -1;
+    private int[] _bkOrdinals = [];
 
     private OracleConnection? _conn;
     private volatile bool _stopRequested;
@@ -89,108 +94,68 @@ public sealed partial class TableSync
         _log = loggerFactory.CreateLogger("syncdb.sync");
         Checkpoint = new Checkpoint(config.CheckpointFile, _log);
 
-        var missingKeys = Transformer.TargetKeyColumns
-            .Where(c => !Transformer.TargetColumns.Contains(c))
-            .ToArray();
-        if (missingKeys.Length > 0)
+        _insertSql = ReadSql(config.InsertSqlFile);
+        _updateSql = ReadSql(config.UpdateSqlFile);
+        _deleteSql = ReadSql(config.DeleteSqlFile);
+        _insertBinds = ScanBinds(_insertSql);
+        _updateBinds = ScanBinds(_updateSql);
+        _deleteBinds = ScanBinds(_deleteSql);
+
+        if (config.LinkEnabled)
         {
-            throw new InvalidOperationException(
-                $"TargetKeyColumns [{string.Join(", ", missingKeys)}] not present in TargetColumns");
+            _linkSql = ReadSql(config.LinkSqlFile);
+            _linkBinds = ScanBinds(_linkSql);
+            if (!_insertBinds.Contains(config.NewIdBind, StringComparer.OrdinalIgnoreCase))
+            {
+                throw new ConfigException(
+                    $"LINK_SQL_FILE is set, so the insert SQL ({config.InsertSqlFile}) must capture the new " +
+                    $"row's id with `RETURNING <id> INTO :{config.NewIdBind}` — no :{config.NewIdBind} bind found.");
+            }
+            // Every link bind other than the new id must come from an env var.
+            foreach (var name in _linkBinds)
+            {
+                if (string.Equals(name, config.NewIdBind, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                if (Environment.GetEnvironmentVariable(name) is not { Length: > 0 })
+                {
+                    throw new ConfigException(
+                        $"LINK_SQL_FILE references :{name}, which is resolved from the environment, " +
+                        $"but {name} is not set. Add {name}=... to your .env (or environment).");
+                }
+            }
         }
 
         var key = Identifier(config.KeyColumn);
         var source = QualifiedName(config.SourceTable);
-        var target = QualifiedName(config.TargetTable);
-        var srcCols = string.Join(", ", Transformer.SourceColumns.Select(Identifier));
-        var tgtCols = Transformer.TargetColumns.Select(Identifier).ToArray();
-        var keyCols = Transformer.TargetKeyColumns.Select(Identifier).ToArray();
-        var nonKeyCols = tgtCols.Where(c => !keyCols.Contains(c)).ToArray();
+        var keyCols = config.BusinessKeys.Select(Identifier).ToArray();
 
         _selectFirstSql =
-            $"SELECT {srcCols} FROM {source} " +
-            $"ORDER BY {key} FETCH FIRST :batch_size ROWS ONLY";
+            $"SELECT * FROM {source} ORDER BY {key} FETCH FIRST :batch_size ROWS ONLY";
         _selectNextSql =
-            $"SELECT {srcCols} FROM {source} " +
-            $"WHERE {key} > :last_key " +
+            $"SELECT * FROM {source} WHERE {key} > :last_key " +
             $"ORDER BY {key} FETCH FIRST :batch_size ROWS ONLY";
-
-        // Upsert: bind positions follow TargetColumns, i.e. Transform() output.
-        var using_ = string.Join(", ", tgtCols.Select((c, i) => $":{i + 1} AS {c}"));
-        var on = string.Join(" AND ", keyCols.Select(c => $"t.{c} = s.{c}"));
-        var updateSet = string.Join(", ", nonKeyCols.Select(c => $"t.{c} = s.{c}"));
-        var insertCols = string.Join(", ", tgtCols);
-        var insertVals = string.Join(", ", tgtCols.Select(c => $"s.{c}"));
-        _mergeSql =
-            $"MERGE INTO {target} t " +
-            $"USING (SELECT {using_} FROM dual) s " +
-            $"ON ({on}) " +
-            $"WHEN MATCHED THEN UPDATE SET {updateSet} " +
-            $"WHEN NOT MATCHED THEN INSERT ({insertCols}) VALUES ({insertVals})";
-
-        // Delete: bind positions follow TargetKeyColumns, i.e. TransformKey().
-        var where = string.Join(" AND ", keyCols.Select((c, i) => $"{c} = :{i + 1}"));
-        _deleteSql = $"DELETE FROM {target} WHERE {where}";
 
         if (config.ProcessedEnabled)
         {
             // Queue model: read only pending rows, and stamp the rows read this batch
             // (by KEY_COLUMN) as done in the same transaction that applies them.
-            //
-            // Exception: when quarantine is on, a change row whose business key is
-            // quarantined is left PENDING (see ApplyBatch). To stop those pending
-            // rows from being re-read forever, the fetch also excludes any key that
-            // is in QUARANTINE_TABLE via an anti-join. Net effect: a quarantined key
-            // disappears from the queue until you delete it from QUARANTINE_TABLE —
-            // then its still-pending rows requeue on their own, no flag reset needed.
-            // NOTE: this assumes the change log exposes the target key column(s) under
-            // the same name as QUARANTINE_TABLE (true for the shipped ORDER_ID schema).
+            // When quarantine is on, a still-pending row whose business key is
+            // quarantined is excluded by an anti-join so it doesn't re-spin the head.
             var processed = Identifier(config.ProcessedColumn);
             var notQuarantined = config.QuarantineEnabled
                 ? $"AND NOT EXISTS (SELECT 1 FROM {QualifiedName(config.QuarantineTable)} q WHERE " +
                   string.Join(" AND ", keyCols.Select(c => $"q.{c} = src.{c}")) + ") "
                 : "";
             _selectPendingSql =
-                $"SELECT {srcCols} FROM {source} src " +
+                $"SELECT * FROM {source} src " +
                 $"WHERE {processed} = :pending " +
                 notQuarantined +
                 $"ORDER BY {key} FETCH FIRST :batch_size ROWS ONLY";
             _markSql = $"UPDATE {source} SET {processed} = :1 WHERE {key} = :2";
             _processedPending = CoerceScalar(config.ProcessedPending);
             _processedDone = CoerceScalar(config.ProcessedDone);
-        }
-
-        if (config.LinkEnabled)
-        {
-            // Each inserted target row also gets a link row carrying its own id, the
-            // target business key, the fixed user id, and the fixed user section.
-            // MERGE-on-no-match keeps it idempotent on replay. Only the business key,
-            // user id, and section are bound (positions :1..:n); the link row's own
-            // id is filled by the database as MAX(id)+1.
-            //
-            // Array binding executes the MERGE once per row in arrival order within
-            // the one transaction, so each iteration's MAX(id) sees the rows inserted
-            // by earlier iterations — the ids come out sequential and never collide.
-            var linkTable = QualifiedName(config.LinkTable);
-            var idCol = Identifier(config.LinkIdColumn);
-            var userCol = Identifier(config.LinkUserColumn);
-            var sectionCol = Identifier(config.LinkSectionColumn);
-            var linkBound = keyCols.Append(userCol).Append(sectionCol).ToArray();
-            _linkColumnCount = linkBound.Length;
-            var linkUsing = string.Join(", ", linkBound.Select((c, i) => $":{i + 1} AS {c}"));
-            var linkOn = string.Join(" AND ", linkBound.Select(c => $"t.{c} = s.{c}"));
-            var linkInsertCols = string.Join(", ", linkBound.Prepend(idCol));
-            var nextId = $"(SELECT NVL(MAX({idCol}), 0) + 1 FROM {linkTable})";
-            var linkInsertVals = string.Join(", ", linkBound.Select(c => $"s.{c}").Prepend(nextId));
-            _linkMergeSql =
-                $"MERGE INTO {linkTable} t " +
-                $"USING (SELECT {linkUsing} FROM dual) s " +
-                $"ON ({linkOn}) " +
-                $"WHEN NOT MATCHED THEN INSERT ({linkInsertCols}) VALUES ({linkInsertVals})";
-            // A target delete removes every link row for that business key.
-            var linkWhere = string.Join(" AND ", keyCols.Select((c, i) => $"{c} = :{i + 1}"));
-            _linkDeleteSql = $"DELETE FROM {linkTable} WHERE {linkWhere}";
-            _syncUserId = CoerceScalar(config.SyncUserId);
-            _syncUserSection = CoerceScalar(config.SyncUserSection);
         }
 
         if (config.QuarantineEnabled)
@@ -210,11 +175,8 @@ public sealed partial class TableSync
         if (config.AuditEnabled)
         {
             // One row per change id: CHANGE_ID, business key(s), op, outcome,
-            // detail, recorded_at. MERGE on the change id keeps it idempotent on
-            // replay; the WHEN MATCHED update also refreshes the row when the same
-            // change id is *re-processed* — e.g. a previously QUARANTINED change that
-            // requeues after its key is cleared, whose outcome is now UPSERTED. Without
-            // it the row would keep its stale first outcome.
+            // detail, recorded_at. MERGE on the change id keeps it idempotent and
+            // refreshes the row when the same change id is re-processed.
             var hTable = QualifiedName(config.HistoryTable);
             var hNonKey = keyCols
                 .Concat(["OPERATION", "OUTCOME", "DETAIL", "RECORDED_AT"])
@@ -231,20 +193,30 @@ public sealed partial class TableSync
                 $"WHEN MATCHED THEN UPDATE SET {hUpdate} " +
                 $"WHEN NOT MATCHED THEN INSERT ({hInsertCols}) VALUES ({hInsertVals})";
         }
-
-        _actions = new Dictionary<string, string>
-        {
-            [config.OpInsert] = "upsert",
-            [config.OpUpdate] = "upsert",
-            [config.OpDelete] = "delete",
-        };
-
-        _columnIndex = Transformer.SourceColumns
-            .Select((c, i) => (c, i))
-            .ToDictionary(t => t.c, t => t.i);
-        _keyIndex = Array.IndexOf(Transformer.SourceColumns, config.KeyColumn);
-        _opIndex = Array.IndexOf(Transformer.SourceColumns, config.OpColumn);
     }
+
+    private static string ReadSql(string path)
+    {
+        var sql = File.ReadAllText(path).Trim();
+        // Allow a single trailing semicolon for editor convenience; ODP.NET wants
+        // the statement without it.
+        if (sql.EndsWith(';'))
+        {
+            sql = sql[..^1].TrimEnd();
+        }
+        if (sql.Length == 0)
+        {
+            throw new ConfigException($"SQL file '{path}' is empty.");
+        }
+        return sql;
+    }
+
+    /// <summary>Distinct <c>:NAME</c> bind placeholders referenced by a statement.</summary>
+    private static string[] ScanBinds(string sql) =>
+        BindRegex().Matches(sql)
+            .Select(m => m.Groups[1].Value)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
     /// <summary>
     /// Table/column names come from config, not bind variables — whitelist them.
@@ -260,8 +232,7 @@ public sealed partial class TableSync
 
     /// <summary>
     /// Validate a table name that may be schema-qualified (<c>SCHEMA.TABLE</c>) or
-    /// bare (<c>TABLE</c>). Each part is whitelisted like <see cref="Identifier"/>;
-    /// these are interpolated into SQL, not bound, so the whitelist guards injection.
+    /// bare (<c>TABLE</c>). Each part is whitelisted like <see cref="Identifier"/>.
     /// </summary>
     private static string QualifiedName(string name)
     {
@@ -277,6 +248,11 @@ public sealed partial class TableSync
 
     [GeneratedRegex(@"^[A-Za-z][A-Za-z0-9_$#]*(\.[A-Za-z][A-Za-z0-9_$#]*)?$")]
     private static partial Regex QualifiedNameRegex();
+
+    // A bind placeholder :NAME, not preceded by another ':' or word char (so it
+    // skips PL/SQL := assignment and :: casts).
+    [GeneratedRegex(@"(?<![:\w]):([A-Za-z_][A-Za-z0-9_]*)")]
+    private static partial Regex BindRegex();
 
     /// <summary>
     /// Bind a configured flag/id value as a number when it looks like one, so a
@@ -349,6 +325,7 @@ public sealed partial class TableSync
         // Prefetch the whole batch in one round trip (ODP.NET's arraysize knob).
         reader.FetchSize = cmd.RowSize * _config.BatchSize;
         var fieldCount = reader.FieldCount;
+        EnsureColumnMap(reader);
         while (reader.Read())
         {
             var row = new object?[fieldCount];
@@ -363,157 +340,84 @@ public sealed partial class TableSync
     }
 
     /// <summary>
-    /// Classify each change row into a unit of work, preserving order.
-    ///
-    /// Produces one <see cref="RowEvent"/> per change row read (the full-history
-    /// trail) and one <see cref="PlanItem"/> per applicable change. Changes are
-    /// <em>not</em> coalesced: several changes to the same target row all survive,
-    /// in arrival order, so they are replayed one after another at apply time.
-    ///
-    /// A row whose insert is rejected by the transformer (and an apply-time insert
-    /// failure later) <em>quarantines</em> its business key: that key is added to
-    /// <paramref name="newQuarantine"/> for persistence and every later change for
-    /// it — in this batch or future ones — is skipped.
+    /// Resolve column ordinals from the reader the first time we fetch, then
+    /// validate that the op/key/business-key columns and every data-SQL bind
+    /// actually exist in the source — failing fast on a typo.
     /// </summary>
-    private (List<PlanItem> Items, List<RowEvent> Events, List<RowKey> NewQuarantine) PlanBatch(List<object?[]> rows)
+    private void EnsureColumnMap(OracleDataReader reader)
+    {
+        if (_columnOrdinals is not null)
+        {
+            return;
+        }
+
+        var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < reader.FieldCount; i++)
+        {
+            map[reader.GetName(i)] = i;
+        }
+        _columnOrdinals = map;
+
+        _opOrdinal = RequireColumn(_config.OpColumn, "OP_COLUMN");
+        _keyOrdinal = RequireColumn(_config.KeyColumn, "KEY_COLUMN");
+        _bkOrdinals = _config.BusinessKeys.Select(c => RequireColumn(c, "BUSINESS_KEY_COLUMNS")).ToArray();
+
+        foreach (var (binds, file) in new[]
+        {
+            (_insertBinds, _config.InsertSqlFile),
+            (_updateBinds, _config.UpdateSqlFile),
+            (_deleteBinds, _config.DeleteSqlFile),
+        })
+        {
+            foreach (var name in binds)
+            {
+                if (string.Equals(name, _config.NewIdBind, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue; // output bind (RETURNING ... INTO), not a source column
+                }
+                if (!map.ContainsKey(name))
+                {
+                    throw new ConfigException(
+                        $"{file} binds :{name}, but the source table {_config.SourceTable} has no such column.");
+                }
+            }
+        }
+    }
+
+    private int RequireColumn(string name, string label)
+    {
+        if (_columnOrdinals!.TryGetValue(name, out var i))
+        {
+            return i;
+        }
+        throw new ConfigException(
+            $"{label}='{name}' is not a column of the source table {_config.SourceTable}.");
+    }
+
+    /// <summary>
+    /// Apply one batch in a single transaction: each change row in arrival order,
+    /// then the per-row history and the processed stamps, all committing together.
+    /// Each data row runs on its own savepoint so a non-recoverable failure is
+    /// isolated to that row; recoverable (connection) errors propagate so
+    /// <see cref="WithRetries"/> retries the whole batch.
+    /// </summary>
+    private List<RowEvent> ApplyBatch(List<object?[]> rows)
     {
         var events = new List<RowEvent>(rows.Count);
-        var plan = new List<PlanItem>(rows.Count);
         var newQuarantine = new List<RowKey>();
 
-        foreach (var raw in rows)
-        {
-            var changeId = raw[_keyIndex];
-            var opValue = Convert.ToString(raw[_opIndex], CultureInfo.InvariantCulture) ?? string.Empty;
-            var ev = new RowEvent(changeId, opValue);
-            events.Add(ev);
-
-            if (!_actions.TryGetValue(opValue, out var action))
-            {
-                ev.Mark(Outcome.SkippedBadRow, $"unknown {_config.OpColumn} value '{opValue}'");
-                _log.LogWarning("Skipping {KeyColumn}={KeyValue}: {Detail}", _config.KeyColumn, changeId, ev.Detail);
-                continue;
-            }
-
-            var row = new Row(_columnIndex, raw);
-            RowKey key;
-            try
-            {
-                key = Transformer.TransformKey(row);
-            }
-            catch (TransformException exc)
-            {
-                ev.Mark(Outcome.SkippedBadRow, exc.Message);
-                _log.LogWarning("Skipping {KeyColumn}={KeyValue}: {Message}", _config.KeyColumn, changeId, exc.Message);
-                continue;
-            }
-            ev.KeyValues = [.. key.Values];
-
-            if (_quarantine.Contains(key))
-            {
-                ev.Mark(Outcome.SkippedQuarantined, "business key is quarantined");
-                continue;
-            }
-
-            var isInsert = opValue == _config.OpInsert;
-            object?[] payload;
-            try
-            {
-                payload = action == "upsert" ? Transformer.Transform(row) : [.. key.Values];
-            }
-            catch (TransformException exc)
-            {
-                // A rejected insert quarantines the key; a rejected update/delete
-                // is just skipped (it never created the row in the first place).
-                if (isInsert && _config.QuarantineEnabled)
-                {
-                    ev.Mark(Outcome.Quarantined, exc.Message);
-                    QuarantineKey(key, newQuarantine);
-                    _log.LogWarning(
-                        "Quarantining {KeyColumn}={KeyValue}: insert rejected: {Message}",
-                        _config.KeyColumn, changeId, exc.Message);
-                }
-                else
-                {
-                    ev.Mark(Outcome.SkippedBadRow, exc.Message);
-                    _log.LogWarning("Skipping {KeyColumn}={KeyValue}: {Message}", _config.KeyColumn, changeId, exc.Message);
-                }
-                continue;
-            }
-
-            plan.Add(new PlanItem(changeId, key, isInsert, action, payload, ev));
-        }
-
-        return (plan, events, newQuarantine);
-    }
-
-    /// <summary>Add a key to the in-memory quarantine set and the persist list.</summary>
-    private void QuarantineKey(RowKey key, List<RowKey> pending)
-    {
-        if (_quarantine.Add(key))
-        {
-            pending.Add(key);
-        }
-    }
-
-    /// <summary>
-    /// Whether this change row's business key is quarantined — used to decide it
-    /// should stay PENDING in queue mode. False for rows whose key could not be
-    /// read (KeyValues empty) and whenever quarantine is disabled.
-    /// </summary>
-    private bool IsQuarantined(RowEvent ev) =>
-        _config.QuarantineEnabled
-        && ev.KeyValues.Length == Transformer.TargetKeyColumns.Length
-        && _quarantine.Contains(new RowKey(ev.KeyValues));
-
-    /// <summary>
-    /// Apply one batch in a single transaction: data changes, user links, the
-    /// per-row history, newly quarantined keys, and the processed stamps all
-    /// commit together (or not at all).
-    ///
-    /// When quarantine is enabled a bad row no longer dooms the batch: each data
-    /// statement is tried in bulk first, and only if it fails on data is it
-    /// retried row by row to isolate the offender (recoverable connection errors
-    /// still propagate so the whole batch is retried by <see cref="WithRetries"/>).
-    /// </summary>
-    private void ApplyBatch(
-        List<PlanItem> items, List<RowEvent> events, List<RowKey> newQuarantine)
-    {
         using var tx = _conn!.BeginTransaction();
         try
         {
-            // Apply every change in arrival order. We cannot group all upserts
-            // before all deletes — for a key with delete-then-reinsert that would
-            // wrongly leave it deleted — so we only batch a run of consecutive
-            // same-kind changes and start a new array DML when the kind switches.
-            var run = new List<PlanItem>();
-            string? runAction = null;
-            foreach (var item in items)
+            foreach (var raw in rows)
             {
-                if (run.Count > 0 && item.Action != runAction)
-                {
-                    ApplyRun(runAction!, run, tx, newQuarantine);
-                    run = [];
-                }
-                runAction = item.Action;
-                run.Add(item);
-            }
-            if (run.Count > 0)
-            {
-                ApplyRun(runAction!, run, tx, newQuarantine);
-            }
-
-            // Maintain the link table: add a row for each insert that landed and
-            // remove rows for each delete that landed, in arrival order.
-            if (_config.LinkEnabled)
-            {
-                ApplyLinks(items, tx);
+                events.Add(ProcessRow(raw, tx, newQuarantine));
             }
 
             if (_config.QuarantineEnabled && newQuarantine.Count > 0)
             {
                 var q = newQuarantine.Select(k => k.Values.ToArray()).ToList();
-                ExecuteArray(_quarantineMergeSql!, q, Transformer.TargetKeyColumns.Length, tx);
+                ExecuteArray(_quarantineMergeSql!, q, _config.BusinessKeys.Length, tx);
             }
 
             if (_config.AuditEnabled)
@@ -522,23 +426,15 @@ public sealed partial class TableSync
                 ExecuteArray(_historyMergeSql!, history, _historyColumnCount, tx);
             }
 
-            // Stamp the consumed change rows last so they are marked done only if
-            // their effect (and its history) committed — same transaction. A row
-            // whose business key ended up quarantined is left PENDING so that
-            // clearing the key from QUARANTINE_TABLE requeues it on its own; every
-            // other row (applied, or a keyless/unknown-op bad row) is marked done so
-            // it can never stall the queue head. Built here, after apply, so that
-            // apply-time quarantines (a FAILED insert) are accounted for too.
+            // Stamp consumed change rows last, so they are marked done only if their
+            // effect (and history) committed. A row whose business key ended up
+            // quarantined is left PENDING so clearing the key requeues it.
             if (_config.ProcessedEnabled)
             {
-                var markRows = new List<object?[]>(events.Count);
-                foreach (var ev in events)
-                {
-                    if (!IsQuarantined(ev))
-                    {
-                        markRows.Add([_processedDone, ev.ChangeId]);
-                    }
-                }
+                var markRows = events
+                    .Where(ev => !IsQuarantined(ev))
+                    .Select(ev => new object?[] { _processedDone, ev.ChangeId })
+                    .ToList();
                 if (markRows.Count > 0)
                 {
                     ExecuteArray(_markSql!, markRows, 2, tx);
@@ -551,199 +447,206 @@ public sealed partial class TableSync
             tx.Rollback();
             throw;
         }
-    }
-
-    /// <summary>Apply one run of consecutive same-kind changes via its array DML.</summary>
-    private void ApplyRun(string action, List<PlanItem> run, OracleTransaction tx, List<RowKey> newQuarantine)
-    {
-        if (action == "upsert")
-        {
-            ApplyOp(_mergeSql, run, Transformer.TargetColumns.Length, Outcome.Upserted, tx, newQuarantine);
-        }
-        else
-        {
-            ApplyOp(_deleteSql, run, Transformer.TargetKeyColumns.Length, Outcome.Deleted, tx, newQuarantine);
-        }
+        return events;
     }
 
     /// <summary>
-    /// Apply one data statement for a list of planned items, recording the outcome
-    /// on each item's event. Without quarantine this is a single array DML whose
-    /// failure aborts the batch (the original behavior). With quarantine on, a
-    /// data failure rolls back to a savepoint and the rows are retried one at a
-    /// time so the bad one is isolated, recorded as FAILED, and (if it was an
-    /// insert) its key quarantined — the rest of the batch still applies.
+    /// Apply one change row: pick the SQL for its operation, bind it from the row,
+    /// run it on its own savepoint, then (for an inserted row) run the link SQL.
+    /// Returns the row's outcome event.
     /// </summary>
-    private void ApplyOp(
-        string sql, List<PlanItem> items, int columnCount, string success,
-        OracleTransaction tx, List<RowKey> newQuarantine)
+    private RowEvent ProcessRow(object?[] raw, OracleTransaction tx, List<RowKey> newQuarantine)
     {
-        if (items.Count == 0)
+        var changeId = raw[_keyOrdinal];
+        var opValue = Convert.ToString(raw[_opOrdinal], CultureInfo.InvariantCulture) ?? string.Empty;
+        var ev = new RowEvent(changeId, opValue);
+
+        string sql;
+        string[] binds;
+        bool isInsert = false, isDelete = false;
+        if (opValue == _config.OpInsert) { sql = _insertSql; binds = _insertBinds; isInsert = true; }
+        else if (opValue == _config.OpUpdate) { sql = _updateSql; binds = _updateBinds; }
+        else if (opValue == _config.OpDelete) { sql = _deleteSql; binds = _deleteBinds; isDelete = true; }
+        else
         {
-            return;
+            ev.Mark(Outcome.SkippedBadRow, $"unknown {_config.OpColumn} value '{opValue}'");
+            _log.LogWarning("Skipping {KeyColumn}={KeyValue}: {Detail}", _config.KeyColumn, changeId, ev.Detail);
+            return ev;
         }
 
-        if (!_config.QuarantineEnabled)
+        var key = new RowKey(_bkOrdinals.Select(i => raw[i]).ToArray());
+        ev.KeyValues = [.. key.Values];
+
+        if (_quarantine.Contains(key))
         {
-            ExecuteArray(sql, items.Select(i => i.Payload).ToList(), columnCount, tx);
-            foreach (var item in items)
-            {
-                item.Event.Mark(success, null);
-            }
-            return;
+            ev.Mark(Outcome.SkippedQuarantined, "business key is quarantined");
+            return ev;
         }
 
-        const string savepoint = "syncdb_op";
+        const string savepoint = "syncdb_row";
         tx.Save(savepoint);
         try
         {
-            ExecuteArray(sql, items.Select(i => i.Payload).ToList(), columnCount, tx);
-            foreach (var item in items)
+            var captureId = isInsert && _config.LinkEnabled;
+            var newId = ExecuteData(sql, binds, raw, captureId, tx);
+            ev.Mark(isDelete ? Outcome.Deleted : isInsert ? Outcome.Inserted : Outcome.Updated, null);
+
+            if (isInsert && _config.LinkEnabled)
             {
-                item.Event.Mark(success, null);
+                TryLink(newId, ev, tx);
             }
-            return;
         }
         catch (OracleException exc) when (!exc.IsRecoverable)
         {
-            _log.LogWarning(
-                "Bulk apply of {Count} row(s) failed (ORA-{Code:00000}); isolating bad rows one by one.",
-                items.Count, exc.Number);
-            // Undo the partially-applied array DML, then redo it row by row.
+            // Bad data: undo just this row and record it; the rest of the batch
+            // still commits. A failed insert quarantines its key when enabled.
             tx.Rollback(savepoint);
-        }
-
-        foreach (var item in items)
-        {
-            try
+            var detail = $"ORA-{exc.Number:00000}: {FirstLine(exc.Message)}";
+            ev.Mark(Outcome.Failed, detail);
+            if (isInsert && _config.QuarantineEnabled)
             {
-                ExecuteArray(sql, [item.Payload], columnCount, tx);
-                item.Event.Mark(success, null);
+                QuarantineKey(key, newQuarantine);
+                _log.LogWarning(
+                    "Quarantining {KeyColumn}={KeyValue}: insert failed: {Detail}",
+                    _config.KeyColumn, changeId, detail);
             }
-            catch (OracleException exc) when (!exc.IsRecoverable)
+            else
             {
-                var detail = $"ORA-{exc.Number:00000}: {FirstLine(exc.Message)}";
-                item.Event.Mark(Outcome.Failed, detail);
-                if (item.IsInsert)
-                {
-                    QuarantineKey(item.Key, newQuarantine);
-                    _log.LogWarning(
-                        "Quarantining {KeyColumn}={KeyValue}: insert failed: {Detail}",
-                        _config.KeyColumn, item.ChangeId, detail);
-                }
-                else
-                {
-                    _log.LogWarning(
-                        "Skipping {KeyColumn}={KeyValue}: apply failed: {Detail}",
-                        _config.KeyColumn, item.ChangeId, detail);
-                }
+                _log.LogWarning(
+                    "Skipping {KeyColumn}={KeyValue}: apply failed: {Detail}",
+                    _config.KeyColumn, changeId, detail);
             }
         }
+        // A recoverable OracleException propagates: ApplyBatch rolls back the whole
+        // transaction and WithRetries reconnects and retries the batch.
+        return ev;
     }
 
     /// <summary>
-    /// Maintain the link table for this batch: a row is added for each insert that
-    /// landed and removed for each delete that landed. These are applied in arrival
-    /// order (grouping consecutive same-kind link ops) so a key's insert/delete
-    /// sequence in one batch ends in the right link state.
+    /// Run one data statement for a row, binding each :NAME from the source row by
+    /// column name. When <paramref name="captureId"/> is set, the statement's
+    /// RETURNING ... INTO :NEW_ID output is captured and returned.
     /// </summary>
-    private void ApplyLinks(List<PlanItem> items, OracleTransaction tx)
+    private decimal? ExecuteData(string sql, string[] binds, object?[] raw, bool captureId, OracleTransaction tx)
     {
-        var run = new List<PlanItem>();
-        string? runKind = null;
-        foreach (var item in items)
+        using var cmd = new OracleCommand
         {
-            var kind = LinkKind(item);
-            if (kind is null)
-            {
-                continue;
-            }
-            if (run.Count > 0 && kind != runKind)
-            {
-                ApplyLinkRun(runKind!, run, tx);
-                run = [];
-            }
-            runKind = kind;
-            run.Add(item);
-        }
-        if (run.Count > 0)
+            Connection = _conn!,
+            Transaction = tx,
+            CommandText = sql,
+            BindByName = true,
+        };
+
+        OracleParameter? idParam = null;
+        foreach (var name in binds)
         {
-            ApplyLinkRun(runKind!, run, tx);
+            if (string.Equals(name, _config.NewIdBind, StringComparison.OrdinalIgnoreCase))
+            {
+                idParam = new OracleParameter
+                {
+                    ParameterName = name,
+                    OracleDbType = OracleDbType.Decimal,
+                    Direction = ParameterDirection.Output,
+                };
+                cmd.Parameters.Add(idParam);
+            }
+            else
+            {
+                cmd.Parameters.Add(MakeInput(name, raw[_columnOrdinals![name]]));
+            }
         }
+
+        cmd.ExecuteNonQuery();
+        return captureId ? ToDecimal(idParam?.Value) : null;
     }
 
-    /// <summary>"insert" for a landed insert, "delete" for a landed delete, else none.</summary>
-    private static string? LinkKind(PlanItem item) =>
-        item.IsInsert && item.Event.Outcome == Outcome.Upserted ? "insert"
-        : item.Action == "delete" && item.Event.Outcome == Outcome.Deleted ? "delete"
-        : null;
-
     /// <summary>
-    /// Apply one run of link inserts or link deletes, isolated like the data apply:
-    /// one bulk DML first, and on a data failure a rollback-to-savepoint and a
-    /// row-by-row replay. A link op that still fails does <em>not</em> abort the run
-    /// or undo its already-applied target change — it is recorded as LINK_FAILED and
-    /// skipped. Recoverable errors propagate so the whole batch is retried.
+    /// Run the link statement for a just-inserted row: :NEW_ID is the captured id,
+    /// every other bind comes from an env var. Isolated on its own savepoint so a
+    /// link failure is recorded as LINK_FAILED and the target insert is kept.
     /// </summary>
-    private void ApplyLinkRun(string kind, List<PlanItem> run, OracleTransaction tx)
+    private void TryLink(decimal? newId, RowEvent ev, OracleTransaction tx)
     {
-        var insert = kind == "insert";
-        var sql = insert ? _linkMergeSql! : _linkDeleteSql!;
-        var columnCount = insert ? _linkColumnCount : Transformer.TargetKeyColumns.Length;
-
         const string savepoint = "syncdb_link";
         tx.Save(savepoint);
         try
         {
-            ExecuteArray(sql, run.Select(i => LinkPayload(i, insert)).ToList(), columnCount, tx);
-            return; // all linked/unlinked; rows keep their data outcome
+            using var cmd = new OracleCommand
+            {
+                Connection = _conn!,
+                Transaction = tx,
+                CommandText = _linkSql!,
+                BindByName = true,
+            };
+            foreach (var name in _linkBinds)
+            {
+                var value = string.Equals(name, _config.NewIdBind, StringComparison.OrdinalIgnoreCase)
+                    ? (object?)newId
+                    : CoerceScalar(Environment.GetEnvironmentVariable(name) ?? string.Empty);
+                cmd.Parameters.Add(MakeInput(name, value));
+            }
+            cmd.ExecuteNonQuery();
         }
         catch (OracleException exc) when (!exc.IsRecoverable)
         {
-            _log.LogWarning(
-                "Bulk link {Kind} of {Count} row(s) failed (ORA-{Code:00000}); isolating one by one.",
-                kind, run.Count, exc.Number);
             tx.Rollback(savepoint);
-        }
-
-        foreach (var item in run)
-        {
-            try
-            {
-                ExecuteArray(sql, [LinkPayload(item, insert)], columnCount, tx);
-            }
-            catch (OracleException exc) when (!exc.IsRecoverable)
-            {
-                var detail = $"link {kind} failed: ORA-{exc.Number:00000}: {FirstLine(exc.Message)}";
-                // The target change is already applied; just flag the bad link op.
-                item.Event.Mark(Outcome.LinkFailed, detail);
-                _log.LogWarning(
-                    "{KeyColumn}={KeyValue}: {Detail} — target change kept, link skipped.",
-                    _config.KeyColumn, item.ChangeId, detail);
-            }
+            var detail = $"link failed: ORA-{exc.Number:00000}: {FirstLine(exc.Message)}";
+            ev.Mark(Outcome.LinkFailed, detail);
+            _log.LogWarning(
+                "{KeyColumn}={KeyValue}: {Detail} — target insert kept, link skipped.",
+                _config.KeyColumn, ev.ChangeId, detail);
         }
     }
 
-    private object?[] LinkPayload(PlanItem item, bool insert) =>
-        insert ? [.. item.Key.Values, _syncUserId, _syncUserSection] : [.. item.Key.Values];
-
-    /// <summary>Build one SYNC_ROW_HISTORY tuple from a change row's outcome.</summary>
-    private static object?[] BuildHistoryRow(RowEvent ev)
+    private static OracleParameter MakeInput(string name, object? value) => new()
     {
-        var keyCount = Transformer.TargetKeyColumns.Length;
+        ParameterName = name,
+        Direction = ParameterDirection.Input,
+        Value = value ?? DBNull.Value,
+    };
+
+    private static decimal? ToDecimal(object? value) => value switch
+    {
+        null or DBNull => null,
+        OracleDecimal { IsNull: true } => null,
+        OracleDecimal d => d.Value,
+        decimal d => d,
+        _ => Convert.ToDecimal(value, CultureInfo.InvariantCulture),
+    };
+
+    /// <summary>Add a key to the in-memory quarantine set and the persist list.</summary>
+    private void QuarantineKey(RowKey key, List<RowKey> pending)
+    {
+        if (_quarantine.Add(key))
+        {
+            pending.Add(key);
+        }
+    }
+
+    /// <summary>
+    /// Whether this change row's business key is quarantined — used to keep it
+    /// PENDING in queue mode. False when its key could not be read or quarantine
+    /// is disabled.
+    /// </summary>
+    private bool IsQuarantined(RowEvent ev) =>
+        _config.QuarantineEnabled
+        && ev.KeyValues.Length == _config.BusinessKeys.Length
+        && _quarantine.Contains(new RowKey(ev.KeyValues));
+
+    /// <summary>Build one history tuple (change id, business key(s), op, outcome, detail, time).</summary>
+    private object?[] BuildHistoryRow(RowEvent ev)
+    {
+        var keyCount = _config.BusinessKeys.Length;
         var row = new object?[1 + keyCount + 4];
         var i = 0;
         row[i++] = ev.ChangeId;
         for (var k = 0; k < keyCount; k++)
         {
-            // KeyValues is empty when the key could not be extracted (bad row).
             row[i++] = ev.KeyValues.Length == keyCount ? ev.KeyValues[k] : null;
         }
         row[i++] = ev.Op;
         row[i++] = ev.Outcome;
-        row[i++] = ev.Detail is { Length: > HistoryDetailMax }
-            ? ev.Detail[..HistoryDetailMax]
-            : ev.Detail;
+        row[i++] = ev.Detail is { Length: > HistoryDetailMax } ? ev.Detail[..HistoryDetailMax] : ev.Detail;
         row[i] = DateTime.Now;
         return row;
     }
@@ -785,7 +688,8 @@ public sealed partial class TableSync
 
     /// <summary>
     /// Run one array-bound DML statement: array binding executes <paramref name="sql"/>
-    /// once per row in a single round trip (the equivalent of executemany).
+    /// once per row in a single round trip. Used for the bookkeeping writes
+    /// (history, quarantine, processed marks).
     /// </summary>
     private void ExecuteArray(string sql, List<object?[]> rows, int columnCount, OracleTransaction tx)
     {
@@ -816,8 +720,8 @@ public sealed partial class TableSync
     }
 
     /// <summary>
-    /// Pick an ODP.NET bind type from a column's first non-null value, the way
-    /// python-oracledb infers from the data. Defaults to VARCHAR2.
+    /// Pick an ODP.NET bind type from a column's first non-null value. Defaults to
+    /// VARCHAR2.
     /// </summary>
     private static OracleDbType InferType(object[] column)
     {
@@ -882,23 +786,23 @@ public sealed partial class TableSync
                     return;
                 }
 
-                var (items, events, newQuarantine) = PlanBatch(rows);
-                WithRetries(() => { ApplyBatch(items, events, newQuarantine); return 0; });
+                var events = WithRetries(() => ApplyBatch(rows));
                 rowsProcessed += rows.Count;
-                lastKey = rows[^1][_keyIndex];
+                lastKey = rows[^1][_keyOrdinal];
                 Checkpoint.Save(lastKey, rowsProcessed);
 
-                var upserted = events.Count(e => e.Outcome == Outcome.Upserted);
+                var inserted = events.Count(e => e.Outcome == Outcome.Inserted);
+                var updated = events.Count(e => e.Outcome == Outcome.Updated);
                 var deleted = events.Count(e => e.Outcome == Outcome.Deleted);
                 var failed = events.Count(e => e.Outcome == Outcome.Failed);
                 _log.LogInformation(
-                    "Batch {Batch}: read {Read} changes -> {Upserts} upserts, {Deletes} deletes, " +
-                    "{Failed} failed, {Quarantined} newly quarantined (total {Total}, last {KeyColumn}={KeyValue})",
-                    batchNumber, rows.Count, upserted, deleted, failed, newQuarantine.Count,
+                    "Batch {Batch}: read {Read} changes -> {Inserts} inserts, {Updates} updates, " +
+                    "{Deletes} deletes, {Failed} failed (total {Total}, last {KeyColumn}={KeyValue})",
+                    batchNumber, rows.Count, inserted, updated, deleted, failed,
                     rowsProcessed, _config.KeyColumn, lastKey);
 
-                // A short batch means we are at the tail of the table; loop
-                // straight back to confirm completion instead of sleeping.
+                // A short batch means we are at the tail of the table; loop straight
+                // back to confirm completion instead of sleeping.
                 if (rows.Count == _config.BatchSize)
                 {
                     _log.LogDebug("Sleeping {Seconds:F1}s", _config.SleepSeconds);
@@ -966,19 +870,18 @@ public sealed partial class TableSync
     /// <summary>Outcome recorded in the history table for one change row.</summary>
     private static class Outcome
     {
-        public const string Upserted = "UPSERTED";
+        public const string Inserted = "INSERTED";
+        public const string Updated = "UPDATED";
         public const string Deleted = "DELETED";
-        public const string SkippedBadRow = "SKIPPED_BADROW";   // unknown op / rejected transform
+        public const string SkippedBadRow = "SKIPPED_BADROW";   // unknown op
         public const string SkippedQuarantined = "SKIPPED_QUARANTINED";
-        public const string Quarantined = "QUARANTINED";        // this insert failed -> key quarantined
         public const string Failed = "FAILED";                  // DB rejected the apply
-        public const string LinkFailed = "LINK_FAILED";         // row upserted, but its user link failed
+        public const string LinkFailed = "LINK_FAILED";         // row inserted, but its link failed
     }
 
     /// <summary>
-    /// The fate of one change row, accumulated as it is planned and applied and
-    /// written out as one history record. <see cref="Outcome"/> starts unset and
-    /// every code path stamps it exactly once via <see cref="Mark"/>.
+    /// The fate of one change row, written out as one history record.
+    /// <see cref="Outcome"/> starts unset and every path stamps it via <see cref="Mark"/>.
     /// </summary>
     private sealed class RowEvent(object? changeId, string op)
     {
@@ -993,18 +896,5 @@ public sealed partial class TableSync
             Outcome = outcome;
             Detail = detail;
         }
-    }
-
-    /// <summary>One unit of work plus a link back to its history event.</summary>
-    private sealed class PlanItem(
-        object? changeId, RowKey key, bool isInsert,
-        string action, object?[] payload, RowEvent ev)
-    {
-        public object? ChangeId { get; } = changeId;
-        public RowKey Key { get; } = key;
-        public bool IsInsert { get; } = isInsert;            // this change is an insert
-        public string Action { get; } = action;              // "upsert" | "delete"
-        public object?[] Payload { get; } = payload;
-        public RowEvent Event { get; } = ev;
     }
 }

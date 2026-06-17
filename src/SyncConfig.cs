@@ -14,21 +14,20 @@ public sealed record SyncConfig(
     int BatchSize,
     double SleepSeconds,
     string SourceTable,
-    string TargetTable,
     string KeyColumn,
     string OpColumn,
     string OpInsert,
     string OpUpdate,
     string OpDelete,
+    string BusinessKeyColumns,
+    string InsertSqlFile,
+    string UpdateSqlFile,
+    string DeleteSqlFile,
+    string LinkSqlFile,
+    string NewIdBind,
     string CheckpointFile,
     string LogLevel,
     string LogFile,
-    string LinkTable,
-    string LinkIdColumn,
-    string LinkUserColumn,
-    string LinkSectionColumn,
-    string SyncUserId,
-    string SyncUserSection,
     string ProcessedColumn,
     string ProcessedPending,
     string ProcessedDone,
@@ -54,25 +53,31 @@ public sealed record SyncConfig(
             BatchSize: GetInt("BATCH_SIZE", 1000),
             SleepSeconds: GetDouble("SLEEP_SECONDS", 5),
             SourceTable: Get("SOURCE_TABLE", "ORDER_CHANGES"),
-            TargetTable: Get("TARGET_TABLE", "ORDER_SUMMARY"),
             KeyColumn: Get("KEY_COLUMN", "CHANGE_ID"),
             OpColumn: Get("OP_COLUMN", "OPERATION"),
             OpInsert: Get("OP_INSERT", "I"),
             OpUpdate: Get("OP_UPDATE", "U"),
             OpDelete: Get("OP_DELETE", "D"),
+            // Business-key column(s) on the SOURCE (comma-separated), used only to
+            // track quarantine and history — not to build any SQL. The apply SQL
+            // is hand-written (see below), so the key is no longer derived from it.
+            BusinessKeyColumns: Get("BUSINESS_KEY_COLUMNS", "ORDER_ID"),
+            // Hand-written SQL, one statement per file, picked by the source row's
+            // operation. Edit these to adapt the sync to your tables; the engine
+            // binds each :NAME placeholder from the source row by column name.
+            InsertSqlFile: Get("INSERT_SQL_FILE", "sql/insert.sql"),
+            UpdateSqlFile: Get("UPDATE_SQL_FILE", "sql/update.sql"),
+            DeleteSqlFile: Get("DELETE_SQL_FILE", "sql/delete.sql"),
+            // Link SQL (optional): when set, it runs after each successful insert
+            // with the new target row's id (bound as :NEW_ID) plus any env-var
+            // binds it references (e.g. :SYNC_USER_ID). Nothing from the source
+            // row. The insert SQL must capture the new id with RETURNING ... INTO
+            // :NEW_ID. Leave blank to disable linking.
+            LinkSqlFile: Get("LINK_SQL_FILE", ""),
+            NewIdBind: Get("NEW_ID_BIND", "NEW_ID"),
             CheckpointFile: Get("CHECKPOINT_FILE", ".sync_checkpoint.json"),
             LogLevel: Get("LOG_LEVEL", "INFO"),
             LogFile: Get("LOG_FILE", ""),
-            // Link table: when set, every change row with OP_INSERT also writes a
-            // row connecting the new target row to a user. The link row carries its
-            // own id (set to MAX(id)+1), the target business key, the fixed user id,
-            // and the fixed user section.
-            LinkTable: Get("LINK_TABLE", ""),
-            LinkIdColumn: Get("LINK_ID_COLUMN", "LINK_ID"),
-            LinkUserColumn: Get("LINK_USER_COLUMN", "USER_ID"),
-            LinkSectionColumn: Get("LINK_SECTION_COLUMN", "USER_SECTION"),
-            SyncUserId: Get("SYNC_USER_ID", ""),
-            SyncUserSection: Get("SYNC_USER_SECTION", ""),
             // Processed column: when set, the source acts as a work queue — only
             // rows whose flag equals PROCESSED_PENDING are read, and they are
             // stamped PROCESSED_DONE in the same transaction that applies them.
@@ -87,24 +92,40 @@ public sealed record SyncConfig(
 
         static SyncConfig Validate(SyncConfig cfg)
         {
-            if (cfg.LinkEnabled && cfg.SyncUserId.Length == 0)
+            foreach (var (label, path) in new[]
             {
-                throw new ConfigException(
-                    "LINK_TABLE is set but SYNC_USER_ID is empty. Set SYNC_USER_ID to the " +
-                    "user id to record for each inserted row, or clear LINK_TABLE to disable linking.");
+                ("INSERT_SQL_FILE", cfg.InsertSqlFile),
+                ("UPDATE_SQL_FILE", cfg.UpdateSqlFile),
+                ("DELETE_SQL_FILE", cfg.DeleteSqlFile),
+            })
+            {
+                if (path.Length == 0)
+                {
+                    throw new ConfigException($"{label} is required (path to the .sql statement for that operation).");
+                }
+                if (!File.Exists(path))
+                {
+                    throw new ConfigException($"{label} points to '{path}', which does not exist.");
+                }
             }
-            if (cfg.LinkEnabled && cfg.SyncUserSection.Length == 0)
+            if (cfg.LinkEnabled && !File.Exists(cfg.LinkSqlFile))
             {
-                throw new ConfigException(
-                    "LINK_TABLE is set but SYNC_USER_SECTION is empty. Set SYNC_USER_SECTION to the " +
-                    "section to record for each inserted row, or clear LINK_TABLE to disable linking.");
+                throw new ConfigException($"LINK_SQL_FILE points to '{cfg.LinkSqlFile}', which does not exist.");
+            }
+            if (cfg.BusinessKeyColumns.Trim().Length == 0)
+            {
+                throw new ConfigException("BUSINESS_KEY_COLUMNS must name at least one source column.");
             }
             return cfg;
         }
     }
 
-    /// <summary>Whether to write a user-link row for each inserted target row.</summary>
-    public bool LinkEnabled => LinkTable.Length > 0;
+    /// <summary>The business-key column names, split from BUSINESS_KEY_COLUMNS.</summary>
+    public string[] BusinessKeys => BusinessKeyColumns
+        .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+
+    /// <summary>Whether a link row is written after each inserted target row.</summary>
+    public bool LinkEnabled => LinkSqlFile.Length > 0;
 
     /// <summary>Whether the source is consumed as a queue via a processed flag.</summary>
     public bool ProcessedEnabled => ProcessedColumn.Length > 0;

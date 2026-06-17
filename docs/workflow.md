@@ -8,10 +8,17 @@
 This describes what the engine does to **each change-log row** and how it behaves
 on **every failure**. Source of truth: [`src/TableSync.cs`](../src/TableSync.cs).
 
+The engine is a thin driver: it reads the source in batches and, for each row,
+runs the **hand-written SQL statement** for that row's operation — one editable
+file each for insert / update / delete (`INSERT_SQL_FILE` / `UPDATE_SQL_FILE` /
+`DELETE_SQL_FILE`). Each `:NAME` placeholder is bound from the source row by
+column name; the source→target transformation lives entirely in those files.
+
 Optional behaviors referenced below are gated by config (see
 [`.env.example`](../.env.example) / [README](../README.md)):
-`PROCESSED_COLUMN` (queue mode), `LINK_TABLE` (user links), `HISTORY_TABLE`
-(audit trail), `QUARANTINE_TABLE` (failed-insert quarantine), `LOG_FILE`.
+`PROCESSED_COLUMN` (queue mode), `LINK_SQL_FILE` (post-insert user links),
+`HISTORY_TABLE` (audit trail), `QUARANTINE_TABLE` (failed-insert quarantine),
+`LOG_FILE`.
 
 ---
 
@@ -19,10 +26,11 @@ Optional behaviors referenced below are gated by config (see
 
 ```
             ┌──────────────────────────────────────────────────────────┐
-            │  START: load .env → connect → LoadQuarantine() into memory │
+            │  START: load .env + SQL files → connect → LoadQuarantine() │
             └───────────────────────────┬──────────────────────────────┘
                                          ▼
         ┌────────────────────────► FETCH BATCH ◄───────────────────────┐
+        │                  SELECT * FROM source                         │
         │                  (queue mode: WHERE processed = pending       │
         │                   AND key NOT IN QUARANTINE_TABLE             │
         │                   ORDER BY key FETCH FIRST :n                 │
@@ -31,14 +39,12 @@ Optional behaviors referenced below are gated by config (see
         │                       rows.Count == 0 ? ──yes──► DONE (exit)  │
         │                                │ no                           │
         │                                ▼                              │
-        │                          PLAN BATCH  ─────► classify each row │
-        │                                │            (Diagram 2)       │
-        │                                ▼                              │
         │                       APPLY BATCH (1 transaction)             │
-        │                                │            (Diagram 3)       │
+        │                                │            (Diagrams 2 + 3)  │
         │           ┌────────────────────┴───────────────────┐         │
-        │           │ changes in order → links → quarantine   │         │
-        │           │ → history → mark processed → COMMIT     │         │
+        │           │ each row in order (pick SQL by op,      │         │
+        │           │  bind, run, link inserts) → quarantine  │         │
+        │           │  → history → mark processed → COMMIT    │         │
         │           └────────────────────┬───────────────────┘         │
         │                                ▼                              │
         │                    save checkpoint + log counts              │
@@ -48,32 +54,22 @@ Optional behaviors referenced below are gated by config (see
 
 ---
 
-## 2. PLAN BATCH — what happens to each change row (every case)
+## 2. Per-row classification — which SQL runs (every case)
 
 ```
   one change-log row
         │
         ▼
-  op in {I,U,D}? ───────no──────────────────────────► [SKIPPED_BADROW]
-        │ yes                                            (unknown op)
+  op == OP_INSERT / OP_UPDATE / OP_DELETE? ──no──► [SKIPPED_BADROW]
+        │ yes (pick insert/update/delete SQL)        (unknown op)
         ▼
-  TransformKey ok? ─────no──────────────────────────► [SKIPPED_BADROW]
-        │ yes                                            (can't read key)
-        ▼
-  key already quarantined? ──yes────────────────────► [SKIPPED_QUARANTINED]
-        │ no                                             (ignore U/D forever)
-        ▼
-  needs Transform (I/U)?
+  read business key (BUSINESS_KEY_COLUMNS)
         │
-        ├─ Transform throws? ──yes──► is it an insert (I)?
-        │                                │ yes → [QUARANTINED]  add key to quarantine
-        │                                │ no  → [SKIPPED_BADROW]
-        │ no (ok, or it's a D)
         ▼
-  append to plan, in arrival order (changes are NOT coalesced:
-        │           every change to a key survives and is replayed)
+  key already quarantined? ──yes────────────────► [SKIPPED_QUARANTINED]
+        │ no                                         (ignore every change forever)
         ▼
-  survives as ONE PlanItem  →  goes to APPLY (Diagram 3)
+  go to APPLY (Diagram 3): run that op's SQL, bind :NAME from the row
 ```
 
 Every row gets exactly one outcome stamped, and (if `HISTORY_TABLE` is on) one
@@ -86,43 +82,44 @@ flag reset.
 
 ---
 
-## 3. APPLY BATCH — the transaction + failure isolation
+## 3. APPLY BATCH — per-row apply + failure isolation
 
 ```
   BEGIN TRANSACTION
         │
         ▼
-  ┌── ApplyOp per run of consecutive same-kind changes, in arrival order ────────────┐
-  │   (a new array DML starts whenever the change kind switches upsert<->delete)      │
-  │                                                                                   │
-  │   SAVEPOINT ──► try ONE bulk array MERGE/DELETE                                   │
-  │                      │                                                            │
-  │            ┌─────────┴───────────┐                                               │
-  │         success                fails                                             │
-  │            │                     │                                               │
-  │   mark all UPSERTED/        OracleException                                       │
-  │     DELETED                      │                                               │
-  │            │          ┌──────────┴───────────┐                                   │
-  │            │      recoverable?            not recoverable                        │
-  │            │      (connection)            (constraint/datatype)                  │
-  │            │          │                       │                                  │
-  │            │      rethrow ──────┐      ROLLBACK TO SAVEPOINT                      │
-  │            │     (whole batch   │             │                                  │
-  │            │      retried by    │      replay ROW BY ROW:                        │
-  │            │      WithRetries)  │        each row → ok? → UPSERTED/DELETED        │
-  │            │                    │                 → fail (non-recov)?             │
-  │            │                    │                     → [FAILED]                  │
-  │            │                    │                     → if INSERT: quarantine key │
-  │            │                    │                     → fail (recov)? → rethrow   │
-  │            ▼                    │                                                 │
-  └────────────────────────────────┼─────────────────────────────────────────────────┘
+  ┌── for each row, in arrival order ─────────────────────────────────────────────┐
+  │                                                                                │
+  │   SAVEPOINT syncdb_row ──► run this op's SQL, binds from the row               │
+  │                      │                                                         │
+  │            ┌─────────┴───────────┐                                            │
+  │         success                fails                                          │
+  │            │                     │                                            │
+  │   mark INSERTED/            OracleException                                    │
+  │     UPDATED/DELETED              │                                            │
+  │            │          ┌──────────┴───────────┐                                │
+  │            │      recoverable?            not recoverable                     │
+  │            │      (connection)            (constraint/datatype/bad date)      │
+  │            │          │                       │                               │
+  │            │      rethrow ──────┐      ROLLBACK TO SAVEPOINT                   │
+  │            │     (whole batch   │             │                               │
+  │            │      retried by    │       mark [FAILED]                         │
+  │            │      WithRetries)  │       if INSERT & quarantine on:            │
+  │            │                    │          add key to quarantine              │
+  │            ▼                    │                                             │
+  │   was it an INSERT and LINK_SQL_FILE set?                                     │
+  │            │ yes                │                                             │
+  │            ▼                    │                                             │
+  │   SAVEPOINT syncdb_link ──► run link SQL (:NEW_ID = the returned id +         │
+  │            │                   env-var binds; nothing from the source row)    │
+  │       ┌────┴────┐              │                                             │
+  │    success    fails (non-recov) → ROLLBACK TO SAVEPOINT → mark [LINK_FAILED]  │
+  │       │         (insert kept)   │  (recoverable → rethrow, retry batch)       │
+  └───────┴─────────────────────────┼──────────────────────────────────────────────┘
         │                          │
-        ▼                          │
-  links (+row per landed INSERT,   │   ◄─── a recoverable error anywhere bubbles up,
-   -rows per landed DELETE)        │        rolls back the WHOLE tx, reconnects, and
-        ▼                          │        retries the entire batch (idempotent)
-  persist new quarantine keys      │
-        ▼                          │
+        ▼                          │   ◄─── a recoverable error anywhere bubbles up,
+  persist new quarantine keys      │        rolls back the WHOLE tx, reconnects, and
+        ▼                          │        retries the entire batch
   write history (every row)        │
         ▼                          │
   mark source rows processed       │   ◄─── EXCEPT rows whose key is quarantined:
@@ -133,22 +130,21 @@ flag reset.
    (on any uncaught error: ROLLBACK whole tx)
 ```
 
-> Note: when `QUARANTINE_TABLE` is **not** set, `ApplyOp` does a single bulk array
-> DML with no isolation — a data failure aborts the batch (and, if non-recoverable,
-> the run), which is the original behavior.
+> **Isolation:** each data row runs on its own savepoint, so a non-recoverable
+> failure is isolated to that one row (recorded `FAILED`) and the rest of the
+> batch still commits. There is no bulk-then-row-by-row retry — rows are applied
+> one at a time to begin with.
 >
-> **Link maintenance is isolated the same way** (`ApplyLinks`): each landed insert
-> adds a link row and each landed delete removes that key's link rows, applied in
-> arrival order (consecutive same-kind ops batched). Each run does a bulk DML first,
-> then rollback-to-savepoint and row-by-row on a data failure. A link op that still
-> fails is recorded as `LINK_FAILED` and skipped — the already-applied target change
-> is **kept** and the run does **not** abort. Recoverable errors still retry the batch.
+> **Linking is post-insert only.** After a successful insert (when `LINK_SQL_FILE`
+> is set) the link SQL runs once, on its own savepoint, with `:NEW_ID` = the id the
+> insert returned via `RETURNING <id> INTO :NEW_ID` plus any env-var binds. Nothing
+> in the link row comes from the source row. A link failure is recorded
+> `LINK_FAILED` and the insert is **kept**. A target **delete** does not unlink
+> anything in the engine — cleanup belongs in your `delete.sql` / schema (the
+> example uses an `ON DELETE CASCADE` foreign key).
 >
-> A link **insert** row carries its own id (`LINK_ID_COLUMN`), the target business
-> key, the fixed `SYNC_USER_ID`, and the fixed `SYNC_USER_SECTION`. The id is filled
-> by the `MERGE` as `MAX(id) + 1`; because array binding runs the `MERGE` once per
-> row in order in the one transaction, each row's `MAX(id)` sees the earlier rows and
-> the ids stay sequential and collision-free (single-writer assumption).
+> The history and processed-mark writes are still array-bound (one round trip
+> each) — only the data apply is row-at-a-time.
 
 ---
 
@@ -156,24 +152,22 @@ flag reset.
 
 | Case | Outcome | Target | Link table | Quarantine | History |
 |------|---------|--------|-----------|-----------|---------|
-| `I` valid | `UPSERTED` | row inserted | + link row | — | UPSERTED |
-| `U` valid (row exists) | `UPSERTED` | row updated | — | — | UPSERTED |
-| `U` valid (row missing) | `UPSERTED` | row inserted via upsert | — (not an `I`) | — | UPSERTED |
-| `D` valid | `DELETED` | row removed | link rows removed | — | DELETED |
-| several changes, same key, same batch | each applied | all applied in order | `I` adds, `D` removes (in order) | — | every row logged |
-| Unknown op / bad key | `SKIPPED_BADROW` | untouched | — | — | SKIPPED_BADROW |
-| `I` rejected by transformer | `QUARANTINED` | untouched | — | **key added** | QUARANTINED |
-| `I` rejected by Oracle (constraint) | `FAILED` | untouched | — | **key added** | FAILED |
+| `I` ok | `INSERTED` | row inserted | + link row (post-insert) | — | INSERTED |
+| `U` ok | `UPDATED` | row updated (0 rows if absent) | — | — | UPDATED |
+| `D` ok | `DELETED` | row removed | link rows removed by `ON DELETE CASCADE` | — | DELETED |
+| Unknown op | `SKIPPED_BADROW` | untouched | — | — | SKIPPED_BADROW |
+| `I` rejected by Oracle (constraint / bad date) | `FAILED` | untouched | — | **key added** | FAILED |
 | `U`/`D` rejected by Oracle | `FAILED` | untouched | — | — (not an insert) | FAILED |
-| `I`/`D` ok but link op fails | `LINK_FAILED` | target change kept | link row not added/removed | — | LINK_FAILED |
+| `I` ok but link SQL fails | `LINK_FAILED` | row kept | link row not added | — | LINK_FAILED |
 | any change on quarantined key | `SKIPPED_QUARANTINED` | untouched | — | already there | SKIPPED_QUARANTINED |
 | connection drop mid-batch | (retried) | nothing until success | — | — | written on the successful attempt |
 
 **Failure principle:** a *recoverable* error (connection) rolls back and retries
 the **whole batch**; a *non-recoverable* error (bad data) is isolated to the
-**single row**, marked `FAILED`/`QUARANTINED` while the rest of the batch commits.
-A quarantined key is skipped forever until you delete it from `SYNC_QUARANTINE`
-(and reset its source rows to pending).
+**single row**, marked `FAILED` while the rest of the batch commits. A failed
+insert also quarantines its business key (when `QUARANTINE_TABLE` is set), so it
+is skipped forever until you delete it from the quarantine table (and, in keyset
+mode, reset/recreate its source rows).
 
 ---
 
@@ -200,19 +194,30 @@ Record every behavior-affecting change here.
   just inserts on no-match. A change id that is **re-processed** (a `QUARANTINED` row
   that requeues after its key is cleared, then applies) refreshes its history row to
   the new outcome/detail/`RECORDED_AT` instead of keeping the stale first outcome.
-  (Needed because the requeue change above lets the same `CHANGE_ID` be processed more
-  than once; before, each was processed at most once so insert-only was sufficient.)
 - **2026-06-15** — Queue mode no longer stamps a quarantined key's change rows as
   processed: they are left **pending** and excluded from the fetch by an anti-join
-  on `QUARANTINE_TABLE`, so they don't re-spin the queue head. Removing the key from
-  `QUARANTINE_TABLE` (then restarting) requeues them with no processed-flag reset —
-  re-running quarantined rows is now a one-table change. (Non-quarantine skips —
-  unknown op, unreadable key — are still stamped done. Assumes the change log
-  exposes the target key column(s) under the same name as `QUARANTINE_TABLE`.)
-- **2026-06-15** — Link insert rows now carry their own id and a user section. The
-  id column (`LINK_ID_COLUMN`) is filled by the `MERGE` as `MAX(id)+1`; the section
-  (`LINK_SECTION_COLUMN`) is the fixed `SYNC_USER_SECTION`, alongside the existing
-  fixed `SYNC_USER_ID`. Both `SYNC_USER_ID` and `SYNC_USER_SECTION` are now required
-  when `LINK_TABLE` is set. (Transformer-only, no flow change: the example now merges
-  three text date parts — day/month/year — into one `ORDER_DATE` instead of splitting
-  a date, and documents the code-map pattern for `STATUS_CODE`/`COUNTRY_CODE`.)
+  on `QUARANTINE_TABLE`, so they don't re-spin the queue head.
+- **2026-06-15** — Link insert rows now carry their own id and a user section.
+- **2026-06-17** — Link table's business-key column(s) made configurable via
+  `LINK_KEY_COLUMNS`.
+- **2026-06-17** — **Major simplification.** The engine no longer generates the
+  apply SQL from column metadata. Instead it runs a **hand-written statement per
+  operation** (`INSERT_SQL_FILE` / `UPDATE_SQL_FILE` / `DELETE_SQL_FILE`), binding
+  each `:NAME` from the source row by column name (`SELECT *` makes every column
+  bindable). The C# transformer (`src/Transformer.cs`) is **removed** — all
+  source→target transformation now lives in those SQL files. Consequences:
+  - Rows are applied **one at a time, each on its own savepoint** (no array-bound
+    `MERGE`/`DELETE`, no bulk-then-row-by-row isolation). History / processed-mark
+    / quarantine writes stay array-bound.
+  - Outcomes are now `INSERTED` / `UPDATED` / `DELETED` (replacing the merged
+    `UPSERTED`); the transformer-reject `QUARANTINED` outcome is gone — a bad insert
+    surfaces as `FAILED` (which still quarantines the key when enabled).
+  - **Linking is post-insert only**: after a successful insert, `LINK_SQL_FILE`
+    runs with `:NEW_ID` (captured from the insert's `RETURNING ... INTO :NEW_ID`)
+    plus env-var binds — nothing from the source row, no `MAX(id)+1`. Link-on-delete
+    is removed; deletes clean up links via the schema (`ON DELETE CASCADE`).
+  - Config: dropped `TARGET_TABLE` and all `LINK_*` column settings; added
+    `INSERT_SQL_FILE` / `UPDATE_SQL_FILE` / `DELETE_SQL_FILE` / `LINK_SQL_FILE`,
+    `NEW_ID_BIND`, and `BUSINESS_KEY_COLUMNS` (source key for quarantine/history).
+    The example `ORDER_SUMMARY` gains an identity `SUMMARY_ID` so the insert has an
+    id to return and the link table references it.
